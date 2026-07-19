@@ -1,0 +1,47 @@
+[project]
+name = "steam-radar"
+version = "0.1.0"
+description = "Telegram bot for monitoring Steam prices and giveaways"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.20,<4",
+  "alembic>=1.15,<2",
+  "apscheduler>=3.11,<4",
+  "asyncpg>=0.30,<1",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.8,<3",
+  "redis>=5.2,<7",
+  "sqlalchemy[asyncio]>=2.0.38,<3",
+  "structlog>=25.1,<26",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+steam-radar = "steam_radar.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/steam_radar"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/steam_radar/i18n.py" = ["E501"]
