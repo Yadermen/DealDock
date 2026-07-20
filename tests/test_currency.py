@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,6 +17,17 @@ class MemoryRedis:
 
     async def set(self, key, value, **kwargs):
         self.data[key] = value
+
+    def lock(self, *args, **kwargs):
+        return MemoryLock()
+
+
+class MemoryLock:
+    async def acquire(self):
+        return True
+
+    async def release(self):
+        return None
 
 
 class Response:
@@ -34,7 +46,7 @@ class Client:
         self.payload, self.error = payload, error
         self.calls = 0
 
-    async def get(self, url):
+    async def get(self, url, **kwargs):
         self.calls += 1
         if self.error:
             raise self.error
@@ -87,3 +99,39 @@ async def test_recent_cached_rates_survive_provider_failure() -> None:
     rates = await failing.rates()
     assert rates.stale
     assert rates.rates["EUR"] == Decimal("0.9")
+
+
+@pytest.mark.asyncio
+async def test_database_rates_are_last_resort_when_provider_and_redis_fail() -> None:
+    saved = SimpleNamespace(
+        rates={"USD": "1", "PLN": "4.1"},
+        provider_updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class Session:
+        async def scalar(self, statement):
+            return saved
+
+    class Context:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *args):
+            return None
+
+    service = CurrencyService(
+        MemoryRedis(),
+        Client(error=httpx.ConnectError("offline")),
+        session_factory=lambda: Context(),
+    )
+    rates = await service.rates()
+    assert rates.source == "postgresql-stale"
+    assert rates.stale and rates.rates["PLN"] == Decimal("4.1")
+
+
+@pytest.mark.asyncio
+async def test_identity_conversion_needs_no_provider_call() -> None:
+    client = Client(error=AssertionError("provider must not be called"))
+    value, rates = await CurrencyService(MemoryRedis(), client).convert(Decimal("12.34"), "PLN", "PLN")
+    assert value == Decimal("12.34") and rates.source == "identity"
+    assert client.calls == 0

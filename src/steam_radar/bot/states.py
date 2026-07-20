@@ -48,6 +48,10 @@ class PremiumFilterSetup(StatesGroup):
     value = State()
 
 
+class DealsFilterSetup(StatesGroup):
+    value = State()
+
+
 class AdminGiveaway(StatesGroup):
     title = State()
     url = State()

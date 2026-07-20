@@ -55,6 +55,8 @@ class User(TimestampMixin, Base):
     comparison_currency: Mapped[str] = mapped_column(String(3), default="USD")
     comparison_regions: Mapped[list[str]] = mapped_column(JSON, default=list)
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    giveaway_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    giveaway_notification_kinds: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["keep", "weekend", "dlc"])
     quiet_hours_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     quiet_hours_start: Mapped[time | None] = mapped_column(Time())
     quiet_hours_end: Mapped[time | None] = mapped_column(Time())
@@ -133,6 +135,29 @@ class PriceSnapshot(Base):
     __table_args__ = (Index("ix_price_game_country_time", "game_id", "country_code", "checked_at"),)
 
 
+class ExternalHistoricalLow(Base):
+    __tablename__ = "external_historical_lows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    game_id: Mapped[int] = mapped_column(ForeignKey("games.id", ondelete="CASCADE"), index=True)
+    country_code: Mapped[str] = mapped_column(String(2))
+    scope: Mapped[str] = mapped_column(String(20))
+    shop_name: Mapped[str | None] = mapped_column(String(100))
+    price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(3))
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    __table_args__ = (Index("uq_external_low_game_country_scope", "game_id", "country_code", "scope", unique=True),)
+
+
+class CurrencyRateCache(Base):
+    __tablename__ = "currency_rate_cache"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    base_currency: Mapped[str] = mapped_column(String(3), default="USD")
+    rates: Mapped[dict] = mapped_column(JSON)
+    provider_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Giveaway(TimestampMixin, Base):
     __tablename__ = "giveaways"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -148,6 +173,15 @@ class Giveaway(TimestampMixin, Base):
     external_id: Mapped[str | None] = mapped_column(String(100), unique=True)
     image_url: Mapped[str | None] = mapped_column(Text)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GiveawayNotificationLog(Base):
+    __tablename__ = "giveaway_notification_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    giveaway_id: Mapped[int] = mapped_column(ForeignKey("giveaways.id", ondelete="CASCADE"), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), unique=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class SyncRun(Base):
@@ -190,6 +224,7 @@ class DeferredNotification(Base):
     fingerprint: Mapped[str] = mapped_column(String(128), index=True)
     notification_type: Mapped[str] = mapped_column(String(30))
     content: Mapped[str] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     send_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from steam_radar.bot.handlers import _comparison_rule_error, _parse_compare_callback
-from steam_radar.bot.keyboards import comparison_groups_keyboard, comparison_regions_keyboard
+from steam_radar.bot.keyboards import (
+    comparison_groups_keyboard,
+    comparison_regions_keyboard,
+    comparison_result_keyboard,
+)
 from steam_radar.constants import REGION_GROUPS
 from steam_radar.i18n import TEXTS, text
 
@@ -68,6 +72,12 @@ def test_comparison_group_keyboard_has_menu_no_close_and_compact_regions() -> No
     assert all(len(row) <= 2 for row in regions.inline_keyboard)
     region_callbacks = [button.callback_data for row in regions.inline_keyboard for button in row]
     assert "ui:close" not in region_callbacks
+
+
+def test_comparison_result_returns_to_registered_home_callback() -> None:
+    callbacks = {button.callback_data for row in comparison_result_keyboard("ru").inline_keyboard for button in row}
+    assert "menu:home" in callbacks
+    assert "menu:main" not in callbacks
 
 
 @pytest.mark.parametrize("language", ["ru", "en", "uk", "kk", "pl"])

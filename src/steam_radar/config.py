@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     backup_interval_hours: int = 24
     backup_retention_days: int = 14
     backup_dir: str = "backups"
+    itad_api_key: str = ""
+    itad_sync_hours: int = 24
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -53,6 +55,7 @@ class Settings(BaseSettings):
         "deal_broadcast_messages_per_second",
         "backup_interval_hours",
         "backup_retention_days",
+        "itad_sync_hours",
     )
     @classmethod
     def positive_integer(cls, value: int) -> int:

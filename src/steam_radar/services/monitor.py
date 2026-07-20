@@ -15,8 +15,17 @@ from sqlalchemy.orm import selectinload
 from steam_radar.bot.keyboards import deal_broadcast_keyboard, notification_keyboard
 from steam_radar.config import Settings
 from steam_radar.constants import REGIONS
-from steam_radar.db.models import DeferredNotification, NotificationLog, PriceSnapshot, SystemError, User, WatchRule
+from steam_radar.db.models import (
+    DeferredNotification,
+    ExternalHistoricalLow,
+    NotificationLog,
+    PriceSnapshot,
+    SystemError,
+    User,
+    WatchRule,
+)
 from steam_radar.i18n import text
+from steam_radar.services.notifications import NotificationData, build_game_notification
 from steam_radar.services.pricing import format_money
 from steam_radar.services.steam import SteamProvider
 
@@ -142,16 +151,54 @@ class PriceMonitor:
                     rule.last_notification_fingerprint = None
             if notification_type and not duplicate and rule.user.notifications_enabled and rule.notifications_enabled:
                 language = rule.user.language_code
-                observed_range = await session.execute(
-                    select(func.min(PriceSnapshot.final_price), func.max(PriceSnapshot.final_price)).where(
-                        PriceSnapshot.game_id == rule.game_id,
-                        PriceSnapshot.country_code == rule.user.country_code,
-                        PriceSnapshot.currency == price.currency,
+                observed_snapshots = list(
+                    (
+                        await session.scalars(
+                            select(PriceSnapshot)
+                            .where(
+                                PriceSnapshot.game_id == rule.game_id,
+                                PriceSnapshot.country_code == rule.user.country_code,
+                                PriceSnapshot.currency == price.currency,
+                            )
+                            .order_by(PriceSnapshot.checked_at)
+                        )
+                    ).all()
+                )
+                observed_prices = [item.final_price for item in observed_snapshots]
+                if not observed_prices or observed_prices[-1] != price.final:
+                    observed_prices.append(price.final)
+                try:
+                    local_now = now.astimezone(ZoneInfo(rule.user.timezone))
+                except ZoneInfoNotFoundError:
+                    local_now = now
+                external_low = await session.scalar(
+                    select(ExternalHistoricalLow).where(
+                        ExternalHistoricalLow.game_id == rule.game_id,
+                        ExternalHistoricalLow.country_code == rule.user.country_code,
+                        ExternalHistoricalLow.scope == "steam",
+                        ExternalHistoricalLow.currency == price.currency,
                     )
                 )
-                minimum, maximum = observed_range.one()
-                content = self._notification_content(rule, price, reasons, historical_low, minimum, maximum, language)
-                markup = notification_keyboard(language, rule.game.steam_app_id)
+                content = build_game_notification(
+                    NotificationData(
+                        app_id=rule.game.steam_app_id,
+                        name=rule.game.name,
+                        image_url=rule.game.header_image,
+                        region_name=text(language, f"region_{rule.user.country_code.lower()}"),
+                        currency=price.currency,
+                        base_price=price.initial,
+                        current_price=price.final,
+                        discount_percent=price.discount_percent,
+                        previous_price=latest.final_price if latest and latest.currency == price.currency else None,
+                        observed_prices=observed_prices,
+                        reasons=reasons,
+                        updated_at=local_now,
+                        premium=rule.user.is_premium,
+                        steam_historical_low=external_low.price if external_low else None,
+                    ),
+                    language,
+                )
+                markup = notification_keyboard(language, rule.game.steam_app_id, rule.id, rule.user.is_premium)
                 send_after = self._quiet_until(rule.user, now)
                 if send_after:
                     session.add(
@@ -162,12 +209,15 @@ class PriceMonitor:
                             fingerprint=fingerprint,
                             notification_type=notification_type,
                             content=content,
+                            image_url=rule.game.header_image,
                             created_at=now,
                             send_after=send_after,
                         )
                     )
                 else:
-                    await self.bot.send_message(rule.user.telegram_id, content, parse_mode="HTML", reply_markup=markup)
+                    await self._send_notification(
+                        rule.user.telegram_id, content, markup, rule.game.header_image, rule.game.steam_app_id
+                    )
                 rule.last_notified_price = price.final
                 rule.last_notified_discount = price.discount_percent
                 rule.last_notification_type = notification_type
@@ -209,19 +259,40 @@ class PriceMonitor:
                         if item.steam_app_id
                         else None
                     )
-                    await self.bot.send_message(
-                        telegram_id,
-                        item.content,
-                        parse_mode="HTML",
-                        reply_markup=markup,
-                        disable_web_page_preview=True,
-                    )
+                    await self._send_notification(telegram_id, item.content, markup, item.image_url, item.steam_app_id)
                     item.sent_at = now
                     sent += 1
                 except Exception as error:
                     log.warning("deferred_notification_failed", notification_id=item.id, error=str(error))
             await session.commit()
         return sent
+
+    async def _send_notification(
+        self, telegram_id: int, content: str, markup, image_url: str | None, app_id: int | None
+    ) -> None:
+        if image_url:
+            try:
+                await self.bot.send_photo(
+                    telegram_id,
+                    photo=image_url,
+                    caption=content,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                return
+            except Exception as error:
+                log.warning(
+                    "notification_image_failed",
+                    steam_app_id=app_id,
+                    exception_type=type(error).__name__,
+                )
+        await self.bot.send_message(
+            telegram_id,
+            content,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
 
     @staticmethod
     def _price_changed(latest: PriceSnapshot | None, price) -> bool:

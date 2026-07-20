@@ -3,6 +3,8 @@ from datetime import UTC, datetime
 
 import httpx
 
+from steam_radar.db.models import GiveawayKind
+
 
 class GiveawaySourceError(RuntimeError):
     pass
@@ -16,6 +18,7 @@ class ExternalGiveaway:
     store: str
     image_url: str | None
     ends_at: datetime | None
+    kind: GiveawayKind
 
 
 class GamerPowerProvider:
@@ -40,6 +43,16 @@ class GamerPowerProvider:
             if not isinstance(item, dict) or not item.get("id") or not item.get("title"):
                 continue
             # The API type=game feed contains limited promotions, not permanent Steam F2P catalog.
+            description = " ".join(
+                str(item.get(key) or "") for key in ("title", "description", "instructions", "type")
+            ).casefold()
+            raw_type = str(item.get("type") or "").casefold()
+            if "dlc" in raw_type or "dlc" in description or "add-on" in description:
+                kind = GiveawayKind.DLC
+            elif any(marker in description for marker in ("free weekend", "play for free", "free period", "trial")):
+                kind = GiveawayKind.WEEKEND
+            else:
+                kind = GiveawayKind.KEEP
             result.append(
                 ExternalGiveaway(
                     external_id=f"gamerpower:{item['id']}",
@@ -48,6 +61,7 @@ class GamerPowerProvider:
                     store="Steam",
                     image_url=item.get("image"),
                     ends_at=_parse_date(item.get("end_date")),
+                    kind=kind,
                 )
             )
         return [item for item in result if item.url.startswith("https://")]

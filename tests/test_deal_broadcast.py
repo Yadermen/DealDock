@@ -51,7 +51,7 @@ def test_admin_deal_broadcast_button_and_permissions() -> None:
     assert is_admin(123, settings)
     assert not is_admin(999, settings)
     callbacks = [button.callback_data for row in admin_keyboard("en").inline_keyboard for button in row]
-    assert "admin:deals_broadcast" in callbacks
+    assert "admin:broadcasts" in callbacks
     assert "await _deny" in inspect.getsource(deals_broadcast_preview)
     assert "await _deny" in inspect.getsource(deals_broadcast_start)
     assert "admin:deals_broadcast_confirm" in inspect.getsource(deals_broadcast_preview)

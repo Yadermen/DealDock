@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -24,13 +25,23 @@ from sqlalchemy.orm import selectinload
 
 from steam_radar.bot.keyboards import (
     active_premium_keyboard,
+    analytics_keyboard,
     back_keyboard,
     comparison_currency_keyboard,
     comparison_groups_keyboard,
     comparison_regions_keyboard,
+    comparison_result_keyboard,
+    deals_analytics_keyboard,
+    deals_filter_input_keyboard,
+    deals_filters_keyboard,
+    deals_keyboard,
+    deals_sort_keyboard,
     digest_keyboard,
     digest_kind_keyboard,
+    dismiss_keyboard,
     games_keyboard,
+    giveaway_types_keyboard,
+    giveaways_keyboard,
     hour_keyboard,
     info_keyboard,
     info_page_keyboard,
@@ -40,7 +51,10 @@ from steam_radar.bot.keyboards import (
     minute_keyboard,
     premium_filters_keyboard,
     premium_games_keyboard,
+    premium_gate_keyboard,
+    premium_info_return_keyboard,
     premium_keyboard,
+    profile_currency_keyboard,
     profile_keyboard,
     quiet_hours_keyboard,
     region_groups_keyboard,
@@ -52,7 +66,7 @@ from steam_radar.bot.keyboards import (
     watch_list_keyboard,
     weekday_keyboard,
 )
-from steam_radar.bot.states import AddGame, EditWatch, Onboarding, PremiumFilterSetup, RegionCompare
+from steam_radar.bot.states import AddGame, DealsFilterSetup, EditWatch, Onboarding, PremiumFilterSetup, RegionCompare
 from steam_radar.config import Settings
 from steam_radar.constants import (
     COMPARISON_CURRENCIES,
@@ -60,18 +74,20 @@ from steam_radar.constants import (
     LANGUAGES,
     MAX_COMPARISON_REGIONS,
     PREMIUM_GAME_LIMIT,
+    PREMIUM_PRICES,
     REGIONS,
 )
-from steam_radar.db.models import Game, Giveaway, Payment, Plan, PriceSnapshot, User, WatchRule
+from steam_radar.db.models import ExternalHistoricalLow, Game, Giveaway, Payment, Plan, PriceSnapshot, User, WatchRule
 from steam_radar.db.repositories import get_or_create_game, get_or_create_user, get_user, watch_count
 from steam_radar.i18n import text
-from steam_radar.services.currency import CurrencyError, CurrencyService
-from steam_radar.services.premium_analytics import deal_label_key, price_analytics
+from steam_radar.services.analytics import AnalyticsSnapshot, build_price_analytics_card, calculate_purchase_score
+from steam_radar.services.currency import CurrencyError, CurrencyService, ExchangeRates
+from steam_radar.services.itad import HistoricalLowSync, ITADError
 from steam_radar.services.pricing import NormalizedPrice, format_money, format_price_card
-from steam_radar.services.steam import SteamError, SteamGame, SteamProvider
+from steam_radar.services.region_comparison import CachedRegionalPrice, RegionalPriceComparison
+from steam_radar.services.steam import SteamError, SteamGame, SteamPrice, SteamProvider
 
 router = Router(name="user")
-PREMIUM_PRICES = {1: 100, 3: 270, 12: 900}
 log = structlog.get_logger()
 
 
@@ -104,6 +120,26 @@ def _comparison_rule_error(user: User | None, rule: WatchRule | None) -> str | N
 
 async def _user(session: AsyncSession, telegram_id: int) -> User | None:
     return await get_user(session, telegram_id)
+
+
+async def _show_premium_gate(
+    callback: CallbackQuery,
+    language: str,
+    back_callback: str,
+    feature: str = "tools",
+) -> None:
+    months = max(PREMIUM_PRICES)
+    stars = PREMIUM_PRICES[months]
+    await callback.message.edit_text(
+        text(language, f"premium_gate_{feature}"),
+        reply_markup=premium_gate_keyboard(language, back_callback, months, stars),
+    )
+    await callback.answer()
+
+
+def _info_frequency(language: str, hours: int) -> str:
+    key = "info_frequency_hourly" if hours == 1 else "info_frequency_hours"
+    return text(language, key, hours=hours)
 
 
 @router.message(CommandStart())
@@ -844,8 +880,7 @@ async def watch_filters(callback: CallbackQuery, session_factory: async_sessionm
         user, rule = await _premium_rule(session, callback.from_user.id, rule_id)
     language = user.language_code if user else "ru"
     if not user or not user.is_premium:
-        await callback.message.edit_text(text(language, "premium_full_info"), reply_markup=premium_keyboard(language))
-        await callback.answer(text(language, "premium_required"), show_alert=True)
+        await _show_premium_gate(callback, language, f"watch:{rule_id}", "filters")
         return
     if rule is None:
         await callback.answer(text(language, "game_missing"), show_alert=True)
@@ -1134,24 +1169,96 @@ async def change_timezone(callback: CallbackQuery, session_factory: async_sessio
 @router.callback_query(F.data == "menu:info")
 async def information(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
     language = await _language(session_factory, callback.from_user.id)
-    await callback.message.edit_text(text(language, "info_title"), reply_markup=info_keyboard(language))
+    await _safe_edit_callback(callback, text(language, "info_title"), info_keyboard(language))
     await callback.answer()
 
 
+@router.callback_query(F.data == "settings:comparison_currency")
+async def information_currency(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+    language = user.language_code if user and user.language_code else "ru"
+    current = user.comparison_currency if user else "USD"
+    await _safe_edit_callback(
+        callback,
+        text(language, "info_currency_choose", currency=current),
+        profile_currency_keyboard(language, current),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings_currency:"))
+async def information_currency_save(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    currency = callback.data.split(":", 1)[1]
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+        language = user.language_code if user and user.language_code else "ru"
+        if not user or currency not in COMPARISON_CURRENCIES:
+            await callback.answer(text(language, "invalid_value"), show_alert=True)
+            return
+        user.comparison_currency = currency
+        await session.commit()
+    await _safe_edit_callback(
+        callback,
+        text(language, "info_region_page"),
+        info_page_keyboard(language, "region"),
+    )
+    await callback.answer(text(language, "info_currency_saved", currency=currency))
+
+
 @router.callback_query(F.data.startswith("info:"))
-async def information_page(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
-    page = callback.data.split(":", 1)[1]
-    language = await _language(session_factory, callback.from_user.id)
+async def information_page(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    settings: Settings,
+) -> None:
+    parts = callback.data.split(":")
+    page = parts[1] if len(parts) > 1 else ""
+    origin = parts[2] if len(parts) > 2 else ""
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+    language = user.language_code if user and user.language_code else "ru"
     key = {
         "search": "info_search_page",
-        "monitor": "info_monitor_page",
+        "discounts": "info_discounts_page",
+        "giveaways": "info_giveaways_page",
+        "analytics": "info_analytics_page",
         "premium": "info_premium_page",
         "region": "info_region_page",
+        "start": "info_start_page",
+        "plans": "info_plans_page",
     }.get(page)
     if key is None:
         await callback.answer(text(language, "ui_error"), show_alert=True)
         return
-    await callback.message.edit_text(text(language, key), reply_markup=info_page_keyboard(language))
+
+    values: dict[str, object] = {}
+    if page in {"premium", "plans"}:
+        values = {
+            "free_limit": FREE_GAME_LIMIT,
+            "premium_limit": PREMIUM_GAME_LIMIT,
+            "free_frequency": _info_frequency(language, settings.free_check_hours),
+            "premium_frequency": _info_frequency(language, settings.premium_check_hours),
+            "plans": "\n".join(
+                f"• {text(language, 'premium_period', months=months, stars=stars)}"
+                for months, stars in PREMIUM_PRICES.items()
+            ),
+            "subscription_status": text(
+                language,
+                "info_subscription_active" if user and user.is_premium else "info_subscription_free",
+            ),
+        }
+    back_callback = f"info:{origin}" if origin in {"discounts", "giveaways", "analytics"} else "menu:info"
+    await _safe_edit_callback(
+        callback,
+        text(language, key, **values),
+        info_page_keyboard(
+            language,
+            page,
+            is_premium=bool(user and user.is_premium),
+            premium_back=back_callback,
+        ),
+    )
     await callback.answer()
 
 
@@ -1160,7 +1267,7 @@ async def settings_quiet(callback: CallbackQuery, session_factory: async_session
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
     if not user or not user.is_premium:
-        await callback.answer(text(user.language_code if user else "ru", "premium_required"), show_alert=True)
+        await _show_premium_gate(callback, user.language_code if user else "ru", "menu:settings", "quiet")
         return
     start = user.quiet_hours_start or time(23)
     end = user.quiet_hours_end or time(8)
@@ -1246,11 +1353,12 @@ async def settings_digest(callback: CallbackQuery, session_factory: async_sessio
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
     if not user or not user.is_premium:
-        await callback.answer(text(user.language_code if user else "ru", "premium_required"), show_alert=True)
+        await _show_premium_gate(callback, user.language_code if user else "ru", "menu:settings", "digest")
         return
-    await callback.message.edit_text(
+    await _safe_edit_callback(
+        callback,
         _digest_screen(user),
-        reply_markup=digest_keyboard(user.language_code, user.daily_digest_enabled, user.weekly_digest_enabled),
+        digest_keyboard(user.language_code, user.daily_digest_enabled, user.weekly_digest_enabled),
     )
     await callback.answer()
 
@@ -1263,12 +1371,17 @@ async def digest_kind(callback: CallbackQuery, session_factory: async_sessionmak
     if not user or not user.is_premium:
         await callback.answer(text(user.language_code if user else "ru", "premium_required"), show_alert=True)
         return
-    enabled = user.daily_digest_enabled if kind == "daily" else user.weekly_digest_enabled
-    await callback.message.edit_text(
-        text(user.language_code, f"digest_{kind}_title"),
-        reply_markup=digest_kind_keyboard(user.language_code, kind, enabled),
-    )
+    await _render_digest_kind(callback, user, kind)
     await callback.answer()
+
+
+async def _render_digest_kind(callback: CallbackQuery, user: User, kind: str) -> None:
+    enabled = user.daily_digest_enabled if kind == "daily" else user.weekly_digest_enabled
+    await _safe_edit_callback(
+        callback,
+        _digest_kind_screen(user, kind),
+        digest_kind_keyboard(user.language_code, kind, enabled),
+    )
 
 
 @router.callback_query(F.data.startswith("digest_toggle:"))
@@ -1286,7 +1399,8 @@ async def digest_toggle(callback: CallbackQuery, session_factory: async_sessionm
             user.weekly_digest_enabled = not user.weekly_digest_enabled
             user.weekly_digest_time = user.weekly_digest_time or time(18)
         await session.commit()
-    await settings_digest(callback, session_factory)
+    await _render_digest_kind(callback, user, kind)
+    await callback.answer(text(user.language_code, "digest_saved"))
 
 
 @router.callback_query(F.data == "digest:disable_all")
@@ -1298,7 +1412,25 @@ async def digest_disable_all(callback: CallbackQuery, session_factory: async_ses
             return
         user.daily_digest_enabled = user.weekly_digest_enabled = False
         await session.commit()
-    await settings_digest(callback, session_factory)
+    await _safe_edit_callback(
+        callback,
+        _digest_screen(user),
+        digest_keyboard(user.language_code, False, False),
+    )
+    await callback.answer(text(user.language_code, "digest_saved"))
+
+
+@router.callback_query(F.data == "digest:guide")
+async def digest_guide(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    language = await _language(session_factory, callback.from_user.id)
+    await _safe_edit_callback(
+        callback,
+        text(language, "digest_guide"),
+        InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=text(language, "btn_back"), callback_data="settings:digest")]]
+        ),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("digest_time:"))
@@ -1348,7 +1480,9 @@ async def digest_time_save(callback: CallbackQuery, session_factory: async_sessi
         else:
             user.weekly_digest_time, user.weekly_digest_enabled = value, True
         await session.commit()
-    await settings_digest(callback, session_factory)
+    kind = "daily" if "daily" in prefix else "weekly"
+    await _render_digest_kind(callback, user, kind)
+    await callback.answer(text(user.language_code, "digest_saved"))
 
 
 @router.callback_query(F.data == "digest:weekday")
@@ -1373,8 +1507,8 @@ async def digest_weekday_save(callback: CallbackQuery, session_factory: async_se
             return
         user.weekly_digest_weekday = weekday
         await session.commit()
-    await settings_digest(callback, session_factory)
-    await callback.answer()
+    await _render_digest_kind(callback, user, "weekly")
+    await callback.answer(text(user.language_code, "digest_saved"))
 
 
 @router.callback_query(F.data == "menu:premium")
@@ -1387,11 +1521,15 @@ async def premium(callback: CallbackQuery, session_factory: async_sessionmaker, 
     await callback.answer()
 
 
-@router.callback_query(F.data == "premium:info")
+@router.callback_query(F.data.startswith("premium:info"))
 async def premium_info(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
     language = await _language(session_factory, callback.from_user.id)
-    await callback.message.edit_text(
-        text(language, "premium_full_info"), reply_markup=back_keyboard("premium", language)
+    parts = callback.data.split(":", 2)
+    back_callback = parts[2] if len(parts) == 3 and parts[2] else "menu:premium"
+    await _safe_edit_callback(
+        callback,
+        text(language, "premium_full_info"),
+        premium_info_return_keyboard(language, back_callback),
     )
     await callback.answer()
 
@@ -1457,7 +1595,10 @@ async def payment_success(message: Message, session_factory: async_sessionmaker,
         user.premium_expired_notified_at = None
         user.premium_until = base + timedelta(days=30 * months)
         await session.commit()
-    await message.answer(text(user.language_code, "payment_success", months=months))
+    await message.answer(
+        text(user.language_code, "payment_success", months=months),
+        reply_markup=dismiss_keyboard(user.language_code),
+    )
 
 
 @router.callback_query(F.data == "premium:history")
@@ -1524,7 +1665,7 @@ async def premium_tool_games(callback: CallbackQuery, session_factory: async_ses
     user, rules = await _premium_rules(session_factory, callback.from_user.id)
     language = user.language_code if user else "ru"
     if not user or not user.is_premium:
-        await callback.answer(text(language, "premium_required"), show_alert=True)
+        await _show_premium_gate(callback, language, "menu:premium")
         return
     action = "analytics" if callback.data.endswith("analytics") else "compare"
     content = text(language, f"premium_{action}_choose")
@@ -1535,8 +1676,28 @@ async def premium_tool_games(callback: CallbackQuery, session_factory: async_ses
 
 
 @router.callback_query(F.data.startswith("premium_analytics:"))
-async def premium_game_analytics(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+@router.callback_query(F.data.startswith("analytics_refresh:"))
+@router.callback_query(F.data.startswith("analytics_details:"))
+@router.callback_query(F.data.startswith("analytics_summary:"))
+@router.callback_query(F.data.startswith("deals_analytics:"))
+async def premium_game_analytics(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    redis: Redis,
+    steam: SteamProvider,
+    historical_lows: HistoricalLowSync | None,
+) -> None:
     rule_id = int(callback.data.rsplit(":", 1)[1])
+    refresh = callback.data.startswith("analytics_refresh:")
+    detailed = callback.data.startswith("analytics_details:")
+    if callback.data.startswith("deals_analytics:"):
+        await redis.set(f"analytics:origin:{callback.from_user.id}", "deals:return", ex=3600)
+    elif callback.data.startswith("premium_analytics:"):
+        await redis.delete(f"analytics:origin:{callback.from_user.id}")
+    if refresh and not await redis.set(f"analytics:refresh:{callback.from_user.id}:{rule_id}", "1", ex=60, nx=True):
+        language = await _language(session_factory, callback.from_user.id)
+        await callback.answer(text(language, "analytics_refresh_limited"), show_alert=True)
+        return
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
         language = user.language_code if user else "ru"
@@ -1545,53 +1706,110 @@ async def premium_game_analytics(callback: CallbackQuery, session_factory: async
             .options(selectinload(WatchRule.game))
             .where(WatchRule.id == rule_id, WatchRule.user_id == getattr(user, "id", 0))
         )
-        if not user or not user.is_premium or not rule:
-            await callback.answer(text(language, "premium_required"), show_alert=True)
+        if not user or not rule:
+            await callback.answer(text(language, "game_missing"), show_alert=True)
             return
+        if not user.is_premium:
+            back_callback = f"watch:{rule_id}"
+            if callback.data.startswith("deals_analytics:"):
+                back_callback = "deals:return"
+            await _show_premium_gate(callback, language, back_callback)
+            return
+        country = user.country_code
+    if refresh:
+        await callback.answer(text(language, "analytics_refresh_started"))
+        await callback.message.edit_text(text(language, "analytics_loading"))
+        try:
+            _, price = await steam.details(
+                rule.game.steam_app_id,
+                REGIONS[country].steam_country_code,
+                _steam_language(language),
+                force_refresh=True,
+            )
+            if price is not None:
+                checked_at = datetime.now(UTC)
+                async with session_factory() as session:
+                    db_rule = await session.get(WatchRule, rule.id)
+                    db_rule.last_checked_at = checked_at
+                    session.add(
+                        PriceSnapshot(
+                            game_id=rule.game_id,
+                            country_code=country,
+                            currency=price.currency,
+                            initial_price=price.initial,
+                            final_price=price.final,
+                            discount_percent=price.discount_percent,
+                            checked_at=checked_at,
+                        )
+                    )
+                    await session.commit()
+            if historical_lows:
+                await historical_lows.sync_game(rule.game_id, rule.game.steam_app_id, country)
+        except (SteamError, ITADError):
+            log.warning(
+                "analytics_refresh_partial_failure",
+                rule_id=rule.id,
+                steam_app_id=rule.game.steam_app_id,
+                exc_info=True,
+            )
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
         snapshots = list(
             (
                 await session.scalars(
                     select(PriceSnapshot)
-                    .where(PriceSnapshot.game_id == rule.game_id, PriceSnapshot.country_code == user.country_code)
+                    .where(PriceSnapshot.game_id == rule.game_id, PriceSnapshot.country_code == country)
                     .order_by(PriceSnapshot.checked_at.desc())
-                    .limit(30)
+                    .limit(100)
                 )
             ).all()
         )
+        external = None
+        if historical_lows is None:
+            external = await session.scalar(
+                select(ExternalHistoricalLow).where(
+                    ExternalHistoricalLow.game_id == rule.game_id,
+                    ExternalHistoricalLow.country_code == country,
+                    ExternalHistoricalLow.scope == "steam",
+                )
+            )
+    if historical_lows is not None:
+        external = await historical_lows.get_low(rule.game_id, country, "steam")
     snapshots.reverse()
-    stats = price_analytics(
-        [item.final_price for item in snapshots], snapshots[-1].initial_price if snapshots else None
+    try:
+        zone = ZoneInfo(user.timezone)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("UTC")
+    card = build_price_analytics_card(
+        language,
+        rule.game.name,
+        [
+            AnalyticsSnapshot(
+                item.final_price,
+                item.initial_price,
+                item.currency,
+                item.checked_at.astimezone(zone),
+            )
+            for item in snapshots
+        ],
+        external.price if external else None,
+        external.currency if external else None,
+        external.updated_at if external else None,
+        datetime.now(zone),
+        detailed=detailed,
     )
-    if not stats or not snapshots:
-        content = text(language, "analytics_no_data", game=escape(rule.game.name))
-    else:
-        currency = snapshots[-1].currency
-        if stats.sample_count < 2:
-            content = text(
-                language,
-                "analytics_card_insufficient",
-                game=escape(rule.game.name),
-                current=format_money(stats.current, currency),
-                samples=stats.sample_count,
-            )
-        else:
-            content = text(
-                language,
-                "analytics_card",
-                game=escape(rule.game.name),
-                current=format_money(stats.current, currency),
-                minimum=format_money(stats.minimum, currency),
-                maximum=format_money(stats.maximum, currency),
-                average=format_money(stats.average, currency),
-                saving=format_money(stats.potential_saving, currency),
-                samples=stats.sample_count,
-                trend=stats.trend,
-                trend_direction=text(language, stats.direction_key),
-                score=stats.score,
-                rating=text(language, deal_label_key(stats.score, stats.current, stats.minimum)),
-            )
-    await callback.message.edit_text(content, reply_markup=back_keyboard("premium", language))
-    await callback.answer()
+    origin = await redis.get(f"analytics:origin:{callback.from_user.id}")
+    await callback.message.edit_text(
+        card.content,
+        reply_markup=analytics_keyboard(
+            language,
+            rule.id,
+            detailed=detailed,
+            back_callback=origin or f"watch:{rule.id}",
+        ),
+    )
+    if not refresh:
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("premium_compare:"))
@@ -1620,6 +1838,9 @@ async def premium_region_compare_start(
             rule = await session.scalar(query)
             error_key = _comparison_rule_error(user, rule)
             if error_key:
+                if error_key == "premium_required" and rule is not None:
+                    await _show_premium_gate(callback, language, f"watch:{rule.id}")
+                    return
                 await callback.answer(text(language, error_key), show_alert=True)
                 return
             steam_app_id = rule.game.steam_app_id
@@ -1788,7 +2009,7 @@ async def compare_currency_set(callback: CallbackQuery, state: FSMContext, sessi
     await callback.answer()
 
 
-@router.callback_query(RegionCompare.selecting, F.data == "compare:confirm")
+@router.callback_query(RegionCompare.selecting, F.data.in_({"compare:confirm", "compare:refresh"}))
 async def premium_region_compare_result(
     callback: CallbackQuery,
     state: FSMContext,
@@ -1797,6 +2018,7 @@ async def premium_region_compare_result(
     currency: CurrencyService,
 ) -> None:
     data = await state.get_data()
+    force_refresh = callback.data == "compare:refresh"
     if not isinstance(data.get("rule_id"), int) or not isinstance(data.get("selected", []), list):
         language = await _language(session_factory, callback.from_user.id)
         await state.clear()
@@ -1806,6 +2028,9 @@ async def premium_region_compare_result(
     language = await _language(session_factory, callback.from_user.id)
     if len(selected) < 2:
         await callback.answer(text(language, "compare_minimum_two"), show_alert=True)
+        return
+    if force_refresh and not await steam.redis.set(f"compare:refresh:{callback.from_user.id}", "1", ex=30, nx=True):
+        await callback.answer(text(language, "compare_refresh_limited"), show_alert=True)
         return
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
@@ -1820,50 +2045,73 @@ async def premium_region_compare_result(
         user.comparison_regions = selected
         user.comparison_currency = data.get("comparison_currency", "USD")
         await session.commit()
-    converted: list[tuple[str, object, Decimal]] = []
-    rates_info = None
-    for code in selected:
-        try:
-            _, price = await steam.details(
-                rule.game.steam_app_id, REGIONS[code].steam_country_code, _steam_language(language)
+        cutoff = datetime.now(UTC) - timedelta(hours=1)
+        snapshots = (
+            await session.scalars(
+                select(PriceSnapshot)
+                .where(
+                    PriceSnapshot.game_id == rule.game_id,
+                    PriceSnapshot.country_code.in_(selected),
+                    PriceSnapshot.checked_at >= cutoff,
+                )
+                .order_by(PriceSnapshot.country_code, PriceSnapshot.checked_at.desc())
             )
-            if price is None:
-                continue
-            value, rates_info = await currency.convert(price.final, price.currency, user.comparison_currency)
-            converted.append((code, price, value))
-        except SteamError as error:
-            log.warning(
-                "comparison_steam_region_failed",
-                telegram_id=callback.from_user.id,
-                rule_id=data.get("rule_id"),
-                steam_app_id=rule.game.steam_app_id,
-                region=code,
-                exception_type=type(error).__name__,
+        ).all()
+    if callback.message:
+        await callback.message.edit_text(text(language, "compare_loading", currency=user.comparison_currency))
+    await callback.answer()
+    cached: dict[str, CachedRegionalPrice] = {}
+    for snapshot in snapshots:
+        if force_refresh:
+            break
+        if snapshot.country_code not in cached:
+            cached[snapshot.country_code] = CachedRegionalPrice(
+                SteamPrice(
+                    app_id=rule.game.steam_app_id,
+                    currency=snapshot.currency,
+                    initial=snapshot.initial_price,
+                    final=snapshot.final_price,
+                    discount_percent=snapshot.discount_percent,
+                ),
+                snapshot.checked_at,
             )
-            continue
-        except CurrencyError as error:
-            log.warning(
-                "comparison_currency_failed",
-                telegram_id=callback.from_user.id,
-                rule_id=data.get("rule_id"),
-                steam_app_id=rule.game.steam_app_id,
-                region=code,
-                source_currency=getattr(price, "currency", None),
-                target_currency=user.comparison_currency,
-                exception_type=type(error).__name__,
-            )
-            continue
-    if not converted or rates_info is None:
+    comparison_service = RegionalPriceComparison(steam, concurrency=5, timeout=6)
+    fetched = await comparison_service.fetch(
+        rule.game.steam_app_id,
+        selected,
+        cached,
+        _steam_language(language),
+        force=force_refresh,
+    )
+    if not fetched.prices:
         await callback.message.edit_text(
             text(language, "compare_unavailable"), reply_markup=back_keyboard("premium", language)
         )
-        await callback.answer()
-        await state.clear()
         return
-    converted.sort(key=lambda item: item[2])
-    cheapest = converted[0][2]
+    currencies = {item.price.currency for item in fetched.prices}
+    try:
+        rates_info = (
+            await currency.rates()
+            if currencies != {user.comparison_currency}
+            else ExchangeRates({user.comparison_currency: Decimal(1)}, datetime.now(UTC), source="identity")
+        )
+    except CurrencyError:
+        log.warning("comparison_rates_failed", steam_app_id=rule.game.steam_app_id, exc_info=True)
+        rates_info = ExchangeRates(
+            {user.comparison_currency: Decimal(1)}, datetime.now(UTC), stale=True, source="unavailable"
+        )
+    comparison = comparison_service.apply_rates(fetched, user.comparison_currency, rates_info, rule.game.steam_app_id)
+    converted = [item for item in comparison.prices if item.converted is not None]
+    if not comparison.prices:
+        await callback.message.edit_text(
+            text(language, "compare_unavailable"), reply_markup=back_keyboard("premium", language)
+        )
+        return
+    converted.sort(key=lambda item: item.converted)
+    cheapest = converted[0].converted if converted else None
     lines = []
-    for index, (code, price, value) in enumerate(converted):
+    for index, item in enumerate(converted):
+        code, price, value = item.region, item.price, item.converted
         difference = value - cheapest
         percent = Decimal(0) if cheapest == 0 else (difference / cheapest * 100).quantize(Decimal("1"))
         status = (
@@ -1886,6 +2134,31 @@ async def premium_region_compare_result(
                 status=status,
             )
         )
+    for item in comparison.prices:
+        if item.converted is None:
+            lines.append(
+                text(
+                    language,
+                    "compare_original_only",
+                    region=text(language, REGIONS[item.region].translation_key),
+                    original=format_money(item.price.final, item.price.currency),
+                )
+            )
+    for code in comparison.unavailable:
+        lines.append(
+            text(
+                language,
+                "compare_unavailable_item",
+                region=text(language, REGIONS[code].translation_key),
+            )
+        )
+    warnings = []
+    if comparison.unavailable:
+        missing = ", ".join(text(language, REGIONS[c].translation_key) for c in comparison.unavailable)
+        warnings.append(text(language, "compare_prices_missing", regions=missing))
+    if comparison.unconverted:
+        missing = ", ".join(text(language, REGIONS[c].translation_key) for c in comparison.unconverted)
+        warnings.append(text(language, "compare_conversion_missing", regions=missing))
     updated = rates_info.updated_at.astimezone(ZoneInfo(user.timezone)).strftime("%d.%m.%Y %H:%M %Z")
     content = text(
         language,
@@ -1894,11 +2167,13 @@ async def premium_region_compare_result(
         items="\n\n".join(lines),
         currency=user.comparison_currency,
         updated=updated,
-        stale=text(language, "compare_rates_stale") if rates_info.stale else "",
+        stale=(text(language, "compare_rates_stale") if rates_info.stale else "")
+        + ("\n" + "\n".join(warnings) if warnings else ""),
     )
-    await callback.message.edit_text(content, reply_markup=back_keyboard("premium", language))
-    await callback.answer()
-    await state.clear()
+    await callback.message.edit_text(
+        content,
+        reply_markup=comparison_result_keyboard(language),
+    )
 
 
 @router.callback_query(F.data.startswith("compare"))
@@ -1923,13 +2198,13 @@ async def giveaways(
     if not items and status in {None, "running"}:
         await callback.message.edit_text(
             text(user.language_code, "giveaways_loading"),
-            reply_markup=back_keyboard("home", user.language_code),
+            reply_markup=giveaways_keyboard(user, user.language_code),
         )
     elif not items:
         await callback.message.edit_text(
             text(user.language_code, "giveaways_empty")
             + _updated_label(last_updated, user.timezone, user.language_code),
-            reply_markup=back_keyboard("home", user.language_code),
+            reply_markup=giveaways_keyboard(user, user.language_code),
         )
     else:
         await callback.message.edit_text(
@@ -1944,23 +2219,282 @@ async def giveaways(
             + text(user.language_code, "source", source='<a href="https://www.gamerpower.com/">GamerPower</a>'),
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=back_keyboard("home", user.language_code),
+            reply_markup=giveaways_keyboard(user, user.language_code),
         )
     await callback.answer()
 
 
+@router.callback_query(F.data == "giveaway:toggle")
+async def giveaway_notifications_toggle(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+        user.giveaway_notifications_enabled = not user.giveaway_notifications_enabled
+        enabled = user.giveaway_notifications_enabled
+        language = user.language_code
+        await session.commit()
+    await callback.message.edit_reply_markup(reply_markup=giveaways_keyboard(user, language))
+    await callback.answer(
+        text(language, "giveaway_notifications_changed", state=text(language, "enabled" if enabled else "disabled"))
+    )
+
+
+@router.callback_query(F.data == "giveaway:settings")
+async def giveaway_type_settings(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+    language = user.language_code
+    if not user.is_premium:
+        await _show_premium_gate(callback, language, "menu:giveaways", "giveaways")
+        return
+    await callback.message.edit_text(
+        text(language, "giveaway_types_screen"),
+        reply_markup=giveaway_types_keyboard(user, language),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("giveaway_kind:"))
+async def giveaway_kind_toggle(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    kind = callback.data.split(":", 1)[1]
+    if kind not in {"keep", "weekend", "dlc"}:
+        await callback.answer()
+        return
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+        language = user.language_code
+        if not user.is_premium:
+            await _show_premium_gate(callback, language, "menu:giveaways")
+            return
+        selected = set(user.giveaway_notification_kinds or [])
+        selected.symmetric_difference_update({kind})
+        user.giveaway_notification_kinds = sorted(selected)
+        await session.commit()
+    await callback.message.edit_reply_markup(reply_markup=giveaway_types_keyboard(user, language))
+    await callback.answer(text(language, "giveaway_types_saved"))
+
+
+@router.callback_query(F.data.startswith("giveaway_kinds:"))
+async def giveaway_kinds_bulk(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    mode = callback.data.split(":", 1)[1]
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+        language = user.language_code
+        if not user.is_premium:
+            await _show_premium_gate(callback, language, "menu:giveaways")
+            return
+        user.giveaway_notification_kinds = ["keep", "weekend", "dlc"] if mode == "all" else []
+        await session.commit()
+    await callback.message.edit_reply_markup(reply_markup=giveaway_types_keyboard(user, language))
+    await callback.answer(text(language, "giveaway_types_saved"))
+
+
+def _deal_value_score(
+    item,
+    low: ExternalHistoricalLow | None,
+    history: list | None = None,
+    now: datetime | None = None,
+) -> int | None:
+    now = now or datetime.now(UTC)
+    source = history or [item]
+    snapshots = [
+        AnalyticsSnapshot(
+            row.final_price,
+            row.initial_price,
+            row.currency,
+            getattr(row, "checked_at", now),
+        )
+        for row in source
+        if row.final_price is not None
+    ]
+    return calculate_purchase_score(
+        snapshots,
+        low.price if low else None,
+        low.currency if low else None,
+        now,
+    )
+
+
+def _deal_rating_key(score: int) -> str:
+    if score >= 90:
+        return "deals_rating_excellent"
+    if score >= 75:
+        return "deals_rating_very_good"
+    if score >= 55:
+        return "deals_rating_normal"
+    if score >= 35:
+        return "deals_rating_wait"
+    return "deals_rating_bad"
+
+
+def _sort_deal_entries(
+    entries: list,
+    sort_key: str,
+    low_by_game: dict[int, ExternalHistoricalLow],
+    histories: dict[int, list] | None = None,
+) -> list:
+    histories = histories or {}
+
+    def price_or_infinity(item) -> Decimal:
+        return item.final_price if item.final_price is not None else Decimal("Infinity")
+
+    if sort_key == "price":
+        return sorted(entries, key=lambda item: (item.final_price is None, price_or_infinity(item)))
+    if sort_key == "value":
+        return sorted(
+            entries,
+            key=lambda item: (
+                _deal_value_score(item, low_by_game.get(item.game_id), histories.get(item.game_id)) is None,
+                -(_deal_value_score(item, low_by_game.get(item.game_id), histories.get(item.game_id)) or 0),
+                price_or_infinity(item),
+            ),
+        )
+    if sort_key == "name":
+        return sorted(entries, key=lambda item: item.name.casefold())
+    return sorted(entries, key=lambda item: (-(item.discount_percent or 0), price_or_infinity(item)))
+
+
+def _default_deals_state() -> dict:
+    return {
+        "current_page": 0,
+        "sort_mode": "discount",
+        "min_discount": 0,
+        "max_price": 0,
+        "historical_low_only": False,
+        "free_only": False,
+        "tracked_only": True,
+        "selected_currency": None,
+        "cached_offer_ids": [],
+        "fetched_at": None,
+    }
+
+
+def _parse_deal_discount(value: str) -> Decimal:
+    parsed = Decimal(value.strip().replace(",", "."))
+    if not parsed.is_finite() or parsed < 0 or parsed > 100:
+        raise ValueError("discount out of range")
+    return parsed.quantize(Decimal("0.01"))
+
+
+def _parse_deal_price(value: str) -> Decimal:
+    parsed = Decimal(value.strip().replace(",", "."))
+    if not parsed.is_finite() or parsed <= 0 or parsed > Decimal("1000000"):
+        raise ValueError("price out of range")
+    return parsed.quantize(Decimal("0.01"))
+
+
+def _decimal_filter_string(value: Decimal) -> str:
+    return format(value, "f").rstrip("0").rstrip(".") or "0"
+
+
+def _deals_filter_screen_text(language: str, deal_state: dict, currency: str) -> str:
+    discount = Decimal(str(deal_state.get("min_discount") or 0))
+    price = Decimal(str(deal_state.get("max_price") or 0))
+    return text(
+        language,
+        "deals_filter_screen_values",
+        discount=f"{_decimal_filter_string(discount)}%" if discount > 0 else text(language, "deals_filter_not_set"),
+        price=format_money(price, currency) if price > 0 else text(language, "deals_filter_not_set"),
+    )
+
+
 @router.callback_query(F.data == "menu:deals")
-async def deals(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+@router.callback_query(F.data == "deals:return")
+@router.callback_query(F.data.in_({"deals:sort_screen", "deals:filter_screen", "deals:analytics_screen"}))
+@router.callback_query(F.data.startswith("deals_page:"))
+@router.callback_query(F.data.startswith("deals_sort:"))
+@router.callback_query(F.data.startswith("deals_filter:"))
+@router.callback_query(F.data.startswith("deals_filter_clear:"))
+async def deals(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    redis: Redis,
+    state: FSMContext,
+) -> None:
+    state_key = f"deals:state:{callback.from_user.id}"
+    raw_state = await redis.get(state_key)
+    try:
+        deal_state = {**_default_deals_state(), **(json.loads(raw_state) if raw_state else {})}
+    except (TypeError, ValueError):
+        deal_state = _default_deals_state()
+    deal_state["min_discount"] = str(deal_state.get("min_discount") or "0")
+    deal_state["max_price"] = str(deal_state.get("max_price") or "0")
+    if callback.data == "deals:filter_screen":
+        await state.clear()
+    if callback.data == "menu:deals":
+        deal_state["current_page"] = 0
+    if callback.data.startswith("deals_page:"):
+        deal_state["current_page"] = int(callback.data.split(":", 1)[1])
+    sort_key = deal_state["sort_mode"]
+    if callback.data.startswith("deals_sort:"):
+        sort_key = callback.data.split(":", 1)[1]
+        if sort_key not in {"discount", "price", "value", "name"}:
+            sort_key = "discount"
+        deal_state["sort_mode"] = sort_key
+        deal_state["current_page"] = 0
+    if callback.data.startswith("deals_filter:"):
+        kind = callback.data.split(":", 1)[1]
+        if kind in {"discount", "max_price"}:
+            async with session_factory() as session:
+                input_user = await _user(session, callback.from_user.id)
+            language = input_user.language_code if input_user else "ru"
+            currency_code = deal_state.get("selected_currency") or (
+                REGIONS[input_user.country_code].currency if input_user else "USD"
+            )
+            current = deal_state["min_discount" if kind == "discount" else "max_price"]
+            await state.set_state(DealsFilterSetup.value)
+            await state.set_data(
+                {
+                    "filter_kind": kind,
+                    "panel_chat_id": callback.message.chat.id,
+                    "panel_message_id": callback.message.message_id,
+                    "currency": currency_code,
+                }
+            )
+            key = "deals_filter_discount_prompt" if kind == "discount" else "deals_filter_price_prompt"
+            current_label = (
+                text(language, "deals_filter_not_set")
+                if Decimal(current) == 0
+                else (f"{current}%" if kind == "discount" else format_money(Decimal(current), currency_code))
+            )
+            await callback.message.edit_text(
+                text(language, key, current=current_label, currency=currency_code),
+                reply_markup=deals_filter_input_keyboard(language, kind),
+            )
+            await callback.answer()
+            return
+        if kind == "historical":
+            deal_state["historical_low_only"] = not deal_state["historical_low_only"]
+        elif kind == "free":
+            deal_state["free_only"] = not deal_state["free_only"]
+        elif kind == "tracked":
+            language = await _language(session_factory, callback.from_user.id)
+            await callback.answer(text(language, "deals_tracked_fixed"), show_alert=True)
+            return
+        elif kind == "reset":
+            preserved_sort = deal_state["sort_mode"]
+            deal_state = _default_deals_state()
+            deal_state["sort_mode"] = preserved_sort
+        deal_state["current_page"] = 0
+    if callback.data.startswith("deals_filter_clear:"):
+        kind = callback.data.split(":", 1)[1]
+        deal_state["min_discount" if kind == "discount" else "max_price"] = "0"
+        deal_state["current_page"] = 0
+        await state.clear()
+    await redis.set(state_key, json.dumps(deal_state), ex=3600)
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
         rows = (
             await session.execute(
                 select(
+                    WatchRule.id.label("rule_id"),
+                    Game.id.label("game_id"),
                     Game.name,
                     Game.steam_app_id,
+                    PriceSnapshot.initial_price,
                     PriceSnapshot.final_price,
                     PriceSnapshot.currency,
                     PriceSnapshot.discount_percent,
+                    PriceSnapshot.checked_at,
                 )
                 .join(WatchRule, WatchRule.game_id == Game.id)
                 .join(PriceSnapshot, PriceSnapshot.game_id == Game.id)
@@ -1970,32 +2504,229 @@ async def deals(callback: CallbackQuery, session_factory: async_sessionmaker) ->
                     PriceSnapshot.discount_percent > 0,
                 )
                 .order_by(PriceSnapshot.checked_at.desc())
-                .limit(20)
+                .limit(100)
             )
         ).all()
+        lows = list(
+            (
+                await session.scalars(
+                    select(ExternalHistoricalLow).where(
+                        ExternalHistoricalLow.country_code == user.country_code,
+                        ExternalHistoricalLow.scope == "steam",
+                    )
+                )
+            ).all()
+        )
     if not rows:
         await callback.message.edit_text(
             text(user.language_code, "deals_empty"),
             reply_markup=back_keyboard("home", user.language_code),
         )
     else:
+        low_by_game = {item.game_id: item for item in lows}
+        histories: dict[int, list] = {}
+        for row in reversed(rows):
+            histories.setdefault(row.game_id, []).append(row)
         seen: set[int] = set()
-        lines = [text(user.language_code, "deals_title")]
-        for name, app_id, price, currency, discount in rows:
-            if app_id in seen:
+        entries = []
+        for row in rows:
+            if row.steam_app_id in seen or row.final_price is None or row.final_price < 0:
                 continue
-            seen.add(app_id)
-            lines.append(
-                f'• <a href="https://store.steampowered.com/app/{app_id}">{name}</a> — '
-                f"{format_money(price, currency)} (−{discount}%)"
+            seen.add(row.steam_app_id)
+            entries.append(row)
+        min_discount = Decimal(deal_state["min_discount"])
+        max_price = Decimal(deal_state["max_price"])
+        entries = [item for item in entries if Decimal(item.discount_percent) >= min_discount]
+        if max_price > 0:
+            entries = [item for item in entries if item.final_price <= max_price]
+        if deal_state["free_only"]:
+            entries = [item for item in entries if item.final_price == 0]
+        if deal_state["historical_low_only"]:
+            entries = [
+                item
+                for item in entries
+                if (low := low_by_game.get(item.game_id))
+                and low.currency == item.currency
+                and item.final_price <= low.price
+            ]
+        entries = _sort_deal_entries(entries, sort_key, low_by_game, histories)
+        page_size = 5
+        pages = max(1, (len(entries) + page_size - 1) // page_size)
+        page = max(0, min(int(deal_state["current_page"]), pages - 1))
+        deal_state["current_page"] = page
+        page_entries = entries[page * page_size : (page + 1) * page_size]
+        deal_state["cached_offer_ids"] = [row.rule_id for row in entries]
+        deal_state["selected_currency"] = page_entries[0].currency if page_entries else None
+        deal_state["fetched_at"] = datetime.now(UTC).isoformat()
+        await redis.set(state_key, json.dumps(deal_state), ex=3600)
+        if callback.data == "deals:sort_screen":
+            await callback.message.edit_text(
+                text(user.language_code, "deals_sort_screen"),
+                reply_markup=deals_sort_keyboard(user.language_code, sort_key),
             )
+            await callback.answer()
+            return
+        if (
+            callback.data == "deals:filter_screen"
+            or callback.data.startswith("deals_filter:")
+            or callback.data.startswith("deals_filter_clear:")
+        ):
+            await callback.message.edit_text(
+                _deals_filter_screen_text(
+                    user.language_code,
+                    deal_state,
+                    deal_state.get("selected_currency") or REGIONS[user.country_code].currency,
+                ),
+                reply_markup=deals_filters_keyboard(user.language_code, deal_state),
+            )
+            await callback.answer()
+            return
+        if callback.data == "deals:analytics_screen":
+            if not user.is_premium:
+                await _show_premium_gate(callback, user.language_code, "deals:return")
+                return
+            await callback.message.edit_text(
+                text(user.language_code, "deals_choose_analytics"),
+                reply_markup=deals_analytics_keyboard(
+                    user.language_code, [(row.rule_id, row.name) for row in page_entries]
+                ),
+            )
+            await callback.answer()
+            return
+        lines = [text(user.language_code, "deals_title")]
+        for index, row in enumerate(page_entries, start=1 + page * page_size):
+            low = low_by_game.get(row.game_id)
+            historical = ""
+            if user.is_premium and low and low.currency == row.currency and low.price > 0:
+                difference = row.final_price - low.price
+                historical = (
+                    "\n" + text(user.language_code, "deals_at_low")
+                    if difference <= 0
+                    else "\n"
+                    + text(
+                        user.language_code,
+                        "deals_historical",
+                        value=format_money(low.price, row.currency),
+                        difference=text(
+                            user.language_code,
+                            "deals_above_low",
+                            value=format_money(difference, row.currency),
+                        ),
+                    )
+                )
+            rating = ""
+            if user.is_premium:
+                score = _deal_value_score(row, low, histories.get(row.game_id))
+                if score is not None:
+                    rating = "\n" + text(
+                        user.language_code,
+                        "deals_rating",
+                        score=score,
+                        verdict=text(user.language_code, _deal_rating_key(score)),
+                    )
+            lines.append(
+                text(
+                    user.language_code,
+                    "deals_card",
+                    index=index,
+                    url=f"https://store.steampowered.com/app/{row.steam_app_id}",
+                    name=escape(row.name),
+                    discount=row.discount_percent,
+                    current=format_money(row.final_price, row.currency),
+                    regular=(
+                        format_money(row.initial_price, row.currency)
+                        if row.initial_price and row.initial_price > row.final_price
+                        else text(user.language_code, "no_data")
+                    ),
+                    rating=rating,
+                    historical=historical,
+                )
+            )
+        if page_entries:
+            lines.append("━━━━━━━━━━━━━━━━━━")
+        filter_parts = []
+        if min_discount > 0:
+            filter_parts.append(
+                text(user.language_code, "deals_filter_summary_discount", value=deal_state["min_discount"])
+            )
+        if max_price > 0:
+            currency = page_entries[0].currency if page_entries else ""
+            filter_parts.append(
+                text(
+                    user.language_code,
+                    "deals_filter_summary_price",
+                    value=format_money(max_price, currency),
+                )
+            )
+        if deal_state["historical_low_only"]:
+            filter_parts.append(text(user.language_code, "deals_filter_historical"))
+        if deal_state["free_only"]:
+            filter_parts.append(text(user.language_code, "deals_filter_free"))
+        lines.append(
+            text(user.language_code, "deals_sort_summary", value=text(user.language_code, f"deals_sort_{sort_key}"))
+        )
+        lines.append(
+            text(
+                user.language_code,
+                "deals_filters_summary",
+                value=", ".join(filter_parts) if filter_parts else text(user.language_code, "deals_filters_none"),
+            )
+        )
+        lines.append(text(user.language_code, "pagination", page=page + 1, pages=pages))
         await callback.message.edit_text(
-            "\n".join(lines),
+            "\n\n".join(lines),
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=back_keyboard("home", user.language_code),
+            reply_markup=deals_keyboard(
+                user.language_code,
+                page,
+                pages,
+                sort_key,
+                [(row.rule_id, row.name) for row in page_entries],
+            ),
         )
     await callback.answer()
+
+
+@router.message(DealsFilterSetup.value)
+async def deals_filter_value_save(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    redis: Redis,
+) -> None:
+    data = await state.get_data()
+    kind = data.get("filter_kind")
+    language = await _language(session_factory, message.from_user.id)
+    try:
+        value = (
+            _parse_deal_discount(message.text or "") if kind == "discount" else _parse_deal_price(message.text or "")
+        )
+    except (InvalidOperation, ValueError):
+        await _replace_panel(
+            message,
+            state,
+            text(language, "deals_filter_invalid_discount" if kind == "discount" else "deals_filter_invalid_price"),
+            deals_filter_input_keyboard(language, kind or "discount"),
+        )
+        return
+    state_key = f"deals:state:{message.from_user.id}"
+    raw = await redis.get(state_key)
+    try:
+        deal_state = {**_default_deals_state(), **(json.loads(raw) if raw else {})}
+    except (TypeError, ValueError):
+        deal_state = _default_deals_state()
+    deal_state["min_discount" if kind == "discount" else "max_price"] = _decimal_filter_string(value)
+    deal_state["current_page"] = 0
+    currency_code = data.get("currency") or "USD"
+    await redis.set(state_key, json.dumps(deal_state), ex=3600)
+    await _replace_panel(
+        message,
+        state,
+        _deals_filter_screen_text(language, deal_state, currency_code),
+        deals_filters_keyboard(language, deal_state),
+    )
+    await state.clear()
 
 
 @router.error()
@@ -2098,6 +2829,19 @@ def _digest_screen(user: User) -> str:
         weekday=text(language, f"weekday_{user.weekly_digest_weekday}"),
         weekly_time=weekly_time,
         timezone=user.timezone,
+    )
+
+
+def _digest_kind_screen(user: User, kind: str) -> str:
+    language = user.language_code
+    enabled = user.daily_digest_enabled if kind == "daily" else user.weekly_digest_enabled
+    send_time = user.daily_digest_time if kind == "daily" else user.weekly_digest_time
+    return text(
+        language,
+        f"digest_{kind}_screen",
+        status=text(language, "enabled_title" if enabled else "disabled_title"),
+        time=(send_time or time(20 if kind == "daily" else 18)).strftime("%H:%M"),
+        weekday=text(language, f"weekday_{user.weekly_digest_weekday}"),
     )
 
 

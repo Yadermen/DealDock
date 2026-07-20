@@ -2,6 +2,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from steam_radar.bot.keyboards import (
+    analytics_keyboard,
+    deals_keyboard,
+    giveaways_keyboard,
     invoice_keyboard,
     main_keyboard,
     notification_keyboard,
@@ -20,6 +23,8 @@ def test_watch_card_has_working_callbacks_and_steam_url() -> None:
         "watch_notify:7",
         "watch_filters:7",
         "watch_delete:7",
+        "premium_analytics:7",
+        "premium_compare:7",
         "menu:games",
         "menu:home",
     }
@@ -53,10 +58,10 @@ def test_watch_list_opens_each_rule() -> None:
     assert keyboard.inline_keyboard[0][0].callback_data == "watch:9"
 
 
-def test_invoice_has_pay_and_menu_buttons() -> None:
+def test_invoice_has_pay_and_close_buttons() -> None:
     keyboard = invoice_keyboard("en", 100)
     assert keyboard.inline_keyboard[0][0].pay
-    assert keyboard.inline_keyboard[1][0].callback_data == "menu:home"
+    assert keyboard.inline_keyboard[1][0].callback_data == "ui:close"
 
 
 def test_notification_has_steam_and_close_buttons() -> None:
@@ -65,6 +70,33 @@ def test_notification_has_steam_and_close_buttons() -> None:
     assert keyboard.inline_keyboard[1][0].callback_data == "ui:close"
 
 
-def test_notification_is_the_only_user_keyboard_with_close_callback() -> None:
+def test_temporary_user_keyboards_use_close_callback() -> None:
     source = (Path(__file__).parents[1] / "src" / "steam_radar" / "bot" / "keyboards.py").read_text(encoding="utf-8")
-    assert source.count('callback_data="ui:close"') == 2
+    assert source.count('callback_data="ui:close"') >= 3
+
+
+def test_deals_pagination_sort_and_analytics_callbacks() -> None:
+    keyboard = deals_keyboard("en", page=1, pages=3, sort="discount", analytics_items=[(7, "Portal 2")])
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    assert "deals_page:0" in callbacks and "deals_page:2" in callbacks
+    assert "deals:sort_screen" in callbacks and "deals:filter_screen" in callbacks
+    assert "deals_analytics:7" in callbacks
+
+
+def test_primary_analytics_and_giveaways_use_menu_not_close() -> None:
+    analytics = analytics_keyboard("en", 7)
+    giveaway_user = SimpleNamespace(is_premium=False, giveaway_notifications_enabled=True)
+    giveaways = giveaways_keyboard(giveaway_user, "en")
+    for keyboard in (analytics, giveaways):
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        assert "menu:home" in callbacks
+        assert "ui:close" not in callbacks
+
+
+def test_multiple_deals_use_single_analytics_selector() -> None:
+    keyboard = deals_keyboard(
+        "en", page=0, pages=1, sort="discount", analytics_items=[(7, "Portal 2"), (8, "Half-Life")]
+    )
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    assert callbacks.count("deals:analytics_screen") == 1
+    assert not any(value and value.startswith("deals_analytics:") for value in callbacks)

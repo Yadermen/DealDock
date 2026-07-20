@@ -58,10 +58,19 @@ def test_all_regions_have_verified_currency_timezone_and_translations() -> None:
 def test_information_navigation_exists_in_every_language() -> None:
     for language in TEXTS:
         assert "menu:info" in _callbacks(main_keyboard(language))
-        assert {"info:search", "info:monitor", "info:premium", "info:region"}.issubset(
-            set(_callbacks(info_keyboard(language)))
-        )
-        assert _callbacks(info_page_keyboard(language)) == ["menu:info", "menu:home"]
+        assert {
+            "info:search",
+            "info:discounts",
+            "info:giveaways",
+            "info:analytics",
+            "info:premium",
+            "info:region",
+            "info:start",
+        }.issubset(set(_callbacks(info_keyboard(language))))
+        assert _callbacks(info_page_keyboard(language)) == ["menu:info"]
+        assert "info:plans" in _callbacks(info_page_keyboard(language, "premium"))
+        assert "menu:info" in _callbacks(info_page_keyboard(language, "premium"))
+        assert "ui:close" not in _callbacks(info_keyboard(language))
         assert any(value.startswith("timezone:") for value in _callbacks(timezone_keyboard(language)) if value)
 
 

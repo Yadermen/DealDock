@@ -4,13 +4,19 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 
 import httpx
+import structlog
 from redis.asyncio import Redis
 
 from steam_radar.services.pricing import InvalidPrice, normalize_steam_price
 
+log = structlog.get_logger()
+
 
 class SteamError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None, transient: bool = False) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = transient
 
 
 @dataclass(slots=True)
@@ -73,6 +79,9 @@ class SteamProvider:
     async def details(
         self, app_id: int, country: str, language: str = "russian", force_refresh: bool = False
     ) -> tuple[SteamGame, SteamPrice | None]:
+        country = country.upper()
+        if not re.fullmatch(r"[A-Z]{2}", country):
+            raise SteamError("Invalid two-letter Steam country code", status_code=400)
         key = f"steam:details:{app_id}:{country}:{language}"
         if not force_refresh and (cached := await self.redis.get(key)):
             payload = json.loads(cached)
@@ -84,10 +93,19 @@ class SteamProvider:
                 )
                 response.raise_for_status()
                 wrapper = response.json().get(str(app_id), {})
-            except (httpx.HTTPError, ValueError) as error:
-                raise SteamError(f"Steam Store is unavailable: {error}") from error
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                raise SteamError(
+                    f"Steam Store is unavailable: HTTP {status}",
+                    status_code=status,
+                    transient=status == 429 or 500 <= status < 600,
+                ) from error
+            except httpx.TimeoutException as error:
+                raise SteamError("Steam Store timed out", transient=True) from error
+            except (httpx.RequestError, ValueError) as error:
+                raise SteamError("Steam Store is temporarily unavailable", transient=True) from error
             if not wrapper.get("success"):
-                raise SteamError("Steam не вернул данные об этой игре")
+                raise SteamError("Steam returned success=false", status_code=404)
             payload = wrapper["data"]
             await self.redis.set(key, json.dumps(payload), ex=3600)
         game = SteamGame(
@@ -99,6 +117,7 @@ class SteamProvider:
         )
         price_data = payload.get("price_overview")
         if not price_data:
+            log.info("steam_price_unavailable", steam_app_id=app_id, country_code=country)
             return game, None
         try:
             normalized = normalize_steam_price(price_data)

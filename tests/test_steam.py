@@ -52,3 +52,22 @@ async def test_steam_unavailable_raises_domain_error() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(503))) as client:
         with pytest.raises(Exception, match="Steam Store is unavailable"):
             await SteamProvider(FakeRedis(), client).details(620, "KZ", force_refresh=True)
+
+
+@pytest.mark.asyncio
+async def test_success_false_is_permanent_unavailable_result() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"620": {"success": False}}))
+    ) as client:
+        with pytest.raises(Exception) as raised:
+            await SteamProvider(FakeRedis(), client).details(620, "PL", force_refresh=True)
+    assert raised.value.status_code == 404
+    assert not raised.value.transient
+
+
+@pytest.mark.asyncio
+async def test_invalid_country_code_is_rejected_without_request() -> None:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: pytest.fail("unexpected request"))) as client:
+        with pytest.raises(Exception) as raised:
+            await SteamProvider(FakeRedis(), client).details(620, "POL", force_refresh=True)
+    assert raised.value.status_code == 400

@@ -87,3 +87,4 @@ MAX_COMPARISON_REGIONS = 10
 LANGUAGES = {"ru": "🇷🇺 Русский", "en": "🇬🇧 English", "uk": "🇺🇦 Українська", "pl": "🇵🇱 Polski"}
 FREE_GAME_LIMIT = 10
 PREMIUM_GAME_LIMIT = 100
+PREMIUM_PRICES = {1: 100, 3: 270, 12: 900}

@@ -33,6 +33,28 @@ def test_polish_catalog_is_complete_and_has_no_cyrillic() -> None:
     assert TEXTS["pl"]["btn_close"] == "✖️ Zamknij"
 
 
+def test_premium_information_is_safe_readable_html_in_every_supported_language() -> None:
+    localized_titles = {
+        "ru": "Больше возможностей с Premium",
+        "en": "More possibilities with Premium",
+        "uk": "Більше можливостей із Premium",
+        "pl": "Więcej możliwości z Premium",
+    }
+    forbidden_terms = ("isthereanydeal", "postgresql", "redis", " api", "worker", "http://", "https://")
+
+    for language, title in localized_titles.items():
+        content = text(language, "premium_full_info")
+        normalized = content.casefold()
+
+        assert title in content
+        assert len(content) <= 4096
+        assert content.count("<b>") == content.count("</b>") == 8
+        assert "<" not in content.replace("<b>", "").replace("</b>", "")
+        assert "━━━━━━━━━━━━━━━━━━" in content
+        assert not any(term in normalized for term in forbidden_terms)
+        assert not any(value in content for value in ("None", "null", "NaN"))
+
+
 def test_user_ui_modules_have_no_hardcoded_cyrillic() -> None:
     root = Path(__file__).parents[1] / "src" / "steam_radar"
     files = [

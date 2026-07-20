@@ -43,16 +43,57 @@ def is_admin(user_id: int, settings: Settings) -> bool:
 def admin_keyboard(language: str = "ru") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=text(language, "admin_sync"), callback_data="admin:sync")],
-            [InlineKeyboardButton(text=text(language, "admin_refresh_game"), callback_data="admin:refresh_game")],
-            [InlineKeyboardButton(text=text(language, "admin_users"), callback_data="admin:users")],
-            [InlineKeyboardButton(text=text(language, "admin_errors"), callback_data="admin:errors")],
-            [InlineKeyboardButton(text=text(language, "admin_broadcast"), callback_data="admin:broadcast")],
-            [InlineKeyboardButton(text=text(language, "admin_deals_broadcast"), callback_data="admin:deals_broadcast")],
-            [InlineKeyboardButton(text=text(language, "admin_test"), callback_data="admin:test_premium")],
-            [InlineKeyboardButton(text=text(language, "admin_premium_manage"), callback_data="admin:premium")],
-            [InlineKeyboardButton(text=text(language, "admin_add_giveaway"), callback_data="admin:add_giveaway")],
-            [InlineKeyboardButton(text=text(language, "admin_refresh"), callback_data="admin:panel")],
+            [
+                InlineKeyboardButton(text=text(language, "admin_section_users"), callback_data="admin:users"),
+                InlineKeyboardButton(text=text(language, "admin_section_premium"), callback_data="admin:premium"),
+            ],
+            [
+                InlineKeyboardButton(text=text(language, "admin_section_broadcasts"), callback_data="admin:broadcasts"),
+                InlineKeyboardButton(text=text(language, "admin_section_giveaways"), callback_data="admin:giveaways"),
+            ],
+            [
+                InlineKeyboardButton(text=text(language, "admin_section_sync"), callback_data="admin:sync_section"),
+                InlineKeyboardButton(text=text(language, "admin_section_errors"), callback_data="admin:errors"),
+            ],
+            [InlineKeyboardButton(text=text(language, "admin_section_system"), callback_data="admin:system")],
+            [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
+        ]
+    )
+
+
+def admin_section_keyboard(language: str, section: str) -> InlineKeyboardMarkup:
+    actions = {
+        "broadcasts": [
+            ("admin_broadcast", "admin:broadcast"),
+            ("admin_deals_broadcast", "admin:deals_broadcast"),
+        ],
+        "giveaways": [
+            ("admin_add_giveaway", "admin:add_giveaway"),
+            ("admin_sync", "admin:sync"),
+        ],
+        "sync": [
+            ("admin_sync", "admin:sync"),
+            ("admin_refresh_game", "admin:refresh_game"),
+        ],
+        "system": [("admin_refresh", "admin:panel")],
+    }[section]
+    rows = [[InlineKeyboardButton(text=text(language, key), callback_data=callback)] for key, callback in actions]
+    rows.extend(
+        [
+            [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="admin:panel")],
+            [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_premium_root_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=text(language, "admin_premium_choose"), callback_data="admin_premium_users:0")],
+            [InlineKeyboardButton(text=text(language, "admin_premium_find"), callback_data="admin:premium_search")],
+            [InlineKeyboardButton(text=text(language, "admin_premium_active"), callback_data="admin_premium_active:0")],
+            [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="admin:panel")],
             [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
         ]
     )
@@ -113,6 +154,21 @@ async def admin_panel(
     await callback.message.edit_text(
         await _panel_text(session_factory, redis, language), reply_markup=admin_keyboard(language)
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"admin:broadcasts", "admin:giveaways", "admin:sync_section", "admin:system"}))
+async def admin_section(
+    callback: CallbackQuery, settings: Settings, session_factory: async_sessionmaker, redis: Redis
+) -> None:
+    if await _deny(callback, settings):
+        return
+    language = await _admin_language(session_factory, callback.from_user.id)
+    section = callback.data.split(":", 1)[1].removesuffix("_section")
+    content = text(language, f"admin_{section}_title")
+    if section == "system":
+        content += "\n\n" + await _panel_text(session_factory, redis, language)
+    await callback.message.edit_text(content, reply_markup=admin_section_keyboard(language, section))
     await callback.answer()
 
 
@@ -439,7 +495,7 @@ async def test_premium(callback: CallbackQuery, settings: Settings, session_fact
     )
 
 
-def admin_premium_keyboard(language: str, user_id: int) -> InlineKeyboardMarkup:
+def admin_premium_keyboard(language: str, user_id: int, active: bool | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -474,14 +530,21 @@ def admin_premium_keyboard(language: str, user_id: int) -> InlineKeyboardMarkup:
                 text=text(language, "admin_premium_history"), callback_data=f"admin_premium_history:{user_id}"
             )
         ],
-        [
-            InlineKeyboardButton(
-                text=text(language, "admin_premium_revoke"), callback_data=f"admin_premium_revoke:{user_id}"
-            )
-        ],
-        [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="admin:panel")],
-        [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
     ]
+    if active is not False:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=text(language, "admin_premium_revoke"), callback_data=f"admin_premium_revoke:{user_id}"
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="admin:premium")],
+            [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -512,6 +575,102 @@ async def _premium_user_card(session_factory: async_sessionmaker, user_id: int, 
 
 
 @router.callback_query(F.data == "admin:premium")
+async def admin_premium_root(callback: CallbackQuery, settings: Settings, session_factory: async_sessionmaker) -> None:
+    if await _deny(callback, settings):
+        return
+    language = await _admin_language(session_factory, callback.from_user.id)
+    await callback.message.edit_text(
+        text(language, "admin_premium_root"), reply_markup=admin_premium_root_keyboard(language)
+    )
+    await callback.answer()
+
+
+def _admin_user_label(user: User, language: str) -> str:
+    identity = f"@{user.username}" if user.username else user.display_name or f"ID {user.telegram_id}"
+    status = (
+        text(language, "admin_premium_until_short", value=f"{user.premium_until:%d.%m.%Y}")
+        if user.is_premium
+        else "Free"
+    )
+    return f"{identity[:35]} · {status}"
+
+
+async def _admin_users_markup(users: list[User], language: str, page: int, pages: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_admin_user_label(user, language), callback_data=f"admin_premium_user:{user.id}")]
+        for user in users
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(text=text(language, "btn_previous"), callback_data=f"admin_premium_users:{page - 1}")
+        )
+    if page + 1 < pages:
+        navigation.append(
+            InlineKeyboardButton(text=text(language, "btn_next"), callback_data=f"admin_premium_users:{page + 1}")
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.extend(
+        [
+            [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="admin:premium")],
+            [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin_premium_users:") | F.data.startswith("admin_premium_active:"))
+async def admin_premium_users(callback: CallbackQuery, settings: Settings, session_factory: async_sessionmaker) -> None:
+    if await _deny(callback, settings):
+        return
+    page = max(0, int(callback.data.rsplit(":", 1)[1]))
+    active_only = callback.data.startswith("admin_premium_active:")
+    page_size = 8
+    async with session_factory() as session:
+        query = select(User)
+        count_query = select(func.count()).select_from(User)
+        if active_only:
+            condition = User.premium_until > datetime.now(UTC)
+            query = query.where(condition)
+            count_query = count_query.where(condition)
+        total = await session.scalar(count_query) or 0
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages - 1)
+        users = list(
+            (
+                await session.scalars(query.order_by(User.created_at.desc()).offset(page * page_size).limit(page_size))
+            ).all()
+        )
+    language = await _admin_language(session_factory, callback.from_user.id)
+    await callback.message.edit_text(
+        text(language, "admin_premium_users_title", page=page + 1, pages=pages),
+        reply_markup=await _admin_users_markup(users, language, page, pages),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_premium_user:"))
+async def admin_premium_user_open(
+    callback: CallbackQuery, settings: Settings, session_factory: async_sessionmaker
+) -> None:
+    if await _deny(callback, settings):
+        return
+    user_id = int(callback.data.rsplit(":", 1)[1])
+    language = await _admin_language(session_factory, callback.from_user.id)
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+    if user is None:
+        await callback.answer(text(language, "admin_user_not_found"), show_alert=True)
+        return
+    await callback.message.edit_text(
+        await _premium_user_card(session_factory, user.id, language),
+        reply_markup=admin_premium_keyboard(language, user.id, user.is_premium),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:premium_search")
 async def admin_premium_search_start(
     callback: CallbackQuery, state: FSMContext, settings: Settings, session_factory: async_sessionmaker
 ) -> None:
@@ -519,8 +678,15 @@ async def admin_premium_search_start(
         return
     language = await _admin_language(session_factory, callback.from_user.id)
     await state.set_state(AdminPremium.search)
+    await state.set_data({"prompt_chat_id": callback.message.chat.id, "prompt_message_id": callback.message.message_id})
     await callback.message.edit_text(
-        text(language, "admin_premium_search"), reply_markup=admin_close_keyboard(language)
+        text(language, "admin_premium_search"),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=text(language, "btn_cancel"), callback_data="admin:premium")],
+                [InlineKeyboardButton(text=text(language, "admin_close"), callback_data="admin:close")],
+            ]
+        ),
     )
     await callback.answer()
 
@@ -533,23 +699,38 @@ async def admin_premium_search(
         return
     query = (message.text or "").strip().removeprefix("@")
     language = await _admin_language(session_factory, message.from_user.id)
+    state_data = await state.get_data()
     async with session_factory() as session:
         conditions = [func.lower(User.username) == query.lower()]
         if query.isdigit():
             number = int(query)
             conditions += [User.telegram_id == number, User.id == number]
-        user = await session.scalar(select(User).where(or_(*conditions)).limit(1))
+        users = list((await session.scalars(select(User).where(or_(*conditions)).limit(10))).all())
+    prompt_chat_id = state_data.get("prompt_chat_id")
+    prompt_message_id = state_data.get("prompt_message_id")
+    if prompt_chat_id and prompt_message_id:
+        try:
+            await message.bot.delete_message(prompt_chat_id, prompt_message_id)
+        except TelegramBadRequest:
+            pass
     try:
         await message.delete()
     except TelegramBadRequest:
         pass
-    if user is None:
+    await state.clear()
+    if not users:
         await message.answer(text(language, "admin_user_not_found"), reply_markup=admin_close_keyboard(language))
         return
-    await state.clear()
+    if len(users) > 1:
+        await message.answer(
+            text(language, "admin_premium_ambiguous"),
+            reply_markup=await _admin_users_markup(users, language, 0, 1),
+        )
+        return
+    user = users[0]
     await message.answer(
         await _premium_user_card(session_factory, user.id, language),
-        reply_markup=admin_premium_keyboard(language, user.id),
+        reply_markup=admin_premium_keyboard(language, user.id, user.is_premium),
     )
 
 

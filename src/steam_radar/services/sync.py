@@ -6,7 +6,7 @@ from redis.exceptions import LockError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from steam_radar.db.models import Giveaway, GiveawayKind, SyncRun, SystemError
+from steam_radar.db.models import Giveaway, SyncRun, SystemError
 from steam_radar.services.giveaways import GamerPowerProvider
 from steam_radar.services.monitor import PriceMonitor
 
@@ -73,11 +73,12 @@ class SyncCoordinator:
                             title=item.title,
                             url=item.url,
                             store=item.store,
-                            kind=GiveawayKind.KEEP,
+                            kind=item.kind,
                             approved=True,
                         )
                         session.add(giveaway)
                     giveaway.title, giveaway.url = item.title, item.url
+                    giveaway.kind = item.kind
                     giveaway.image_url, giveaway.ends_at = item.image_url, item.ends_at
                     giveaway.approved, giveaway.active, giveaway.last_seen_at = True, True, now
                 await session.commit()

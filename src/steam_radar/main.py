@@ -23,7 +23,9 @@ from steam_radar.services.backup import create_backup
 from steam_radar.services.currency import CurrencyService
 from steam_radar.services.deal_broadcast import DealBroadcastService
 from steam_radar.services.digest import DigestService
+from steam_radar.services.giveaway_notifications import GiveawayNotificationService
 from steam_radar.services.giveaways import GamerPowerProvider
+from steam_radar.services.itad import HistoricalLowSync, IsThereAnyDealProvider
 from steam_radar.services.monitor import PriceMonitor
 from steam_radar.services.premium import PremiumService
 from steam_radar.services.runtime import HealthServer, PollingLock
@@ -61,16 +63,38 @@ async def main() -> None:
     if not await polling_lock.acquire():
         raise RuntimeError("Another polling instance is already running for this bot token")
 
-    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "SteamRadar/0.1"}) as client:
+    async with httpx.AsyncClient(
+        timeout=15,
+        headers={"User-Agent": "SteamRadar/0.1"},
+        trust_env=False,
+    ) as client:
         steam = SteamProvider(redis, client)
-        currency = CurrencyService(redis, client)
+        currency = CurrencyService(redis, client, session_factory=session_factory)
         monitor = PriceMonitor(bot, session_factory, steam, settings)
         giveaway_provider = GamerPowerProvider(client)
         sync = SyncCoordinator(redis, session_factory, monitor, giveaway_provider)
         premium_service = PremiumService(bot, session_factory)
         digest_service = DigestService(bot, session_factory)
         deal_broadcast_service = DealBroadcastService(bot, session_factory, redis, settings)
-        scheduler = create_scheduler(monitor, sync, premium_service, digest_service)
+        historical_lows = (
+            HistoricalLowSync(
+                IsThereAnyDealProvider(client, settings.itad_api_key),
+                session_factory,
+                settings.itad_sync_hours,
+                redis,
+            )
+            if settings.itad_api_key
+            else None
+        )
+        giveaway_notifications = GiveawayNotificationService(bot, session_factory)
+        scheduler = create_scheduler(
+            monitor,
+            sync,
+            premium_service,
+            digest_service,
+            historical_lows,
+            giveaway_notifications,
+        )
         if settings.backup_enabled:
 
             async def scheduled_backup() -> None:
@@ -88,6 +112,9 @@ async def main() -> None:
         health = HealthServer(settings.health_host, settings.health_port, session_factory, redis, scheduler)
         await health.start()
         initial_sync = asyncio.create_task(sync.full_sync(), name="initial-sync")
+        initial_historical_sync = (
+            asyncio.create_task(historical_lows.run(), name="initial-historical-low-sync") if historical_lows else None
+        )
         await deal_broadcast_service.resume_active()
         try:
             command_names = ("start", "menu", "games", "watch", "deals", "free", "premium", "settings", "help", "terms")
@@ -109,11 +136,14 @@ async def main() -> None:
                 redis=redis,
                 steam=steam,
                 currency=currency,
+                historical_lows=historical_lows,
                 sync=sync,
             )
         finally:
             if not initial_sync.done():
                 initial_sync.cancel()
+            if initial_historical_sync and not initial_historical_sync.done():
+                initial_historical_sync.cancel()
             scheduler.shutdown(wait=False)
             await health.close()
             await polling_lock.release()
