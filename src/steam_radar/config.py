@@ -6,10 +6,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     bot_token: str = ""
-    database_url: str = "postgresql+asyncpg://steam_radar:steam_radar@localhost/steam_radar"
+    database_url: str = (
+        "postgresql+asyncpg://steam_radar:steam_radar@localhost/steam_radar"
+    )
     redis_url: str = "redis://localhost:6379/0"
     admin_ids: frozenset[int] = Field(default_factory=frozenset)
     log_level: str = "INFO"
@@ -40,8 +46,37 @@ class Settings(BaseSettings):
     @classmethod
     def parse_admin_ids(cls, value: object) -> frozenset[int]:
         if isinstance(value, str):
-            return frozenset(int(item.strip()) for item in value.split(",") if item.strip())
+            return frozenset(
+                int(item.strip())
+                for item in value.split(",")
+                if item.strip()
+            )
+
         return frozenset(value or [])
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        value = value.strip()
+
+        if value.startswith("postgresql://"):
+            return value.replace(
+                "postgresql://",
+                "postgresql+asyncpg://",
+                1,
+            )
+
+        if value.startswith("postgres://"):
+            return value.replace(
+                "postgres://",
+                "postgresql+asyncpg://",
+                1,
+            )
+
+        return value
 
     @field_validator(
         "free_check_hours",
@@ -61,6 +96,7 @@ class Settings(BaseSettings):
     def positive_integer(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("value must be greater than zero")
+
         return value
 
     @field_validator("steam_request_delay")
@@ -68,6 +104,7 @@ class Settings(BaseSettings):
     def non_negative_delay(cls, value: float) -> float:
         if value < 0:
             raise ValueError("STEAM_REQUEST_DELAY cannot be negative")
+
         return value
 
     @field_validator("health_port")
@@ -75,6 +112,7 @@ class Settings(BaseSettings):
     def valid_port(cls, value: int) -> int:
         if not 1 <= value <= 65535:
             raise ValueError("HEALTH_PORT must be between 1 and 65535")
+
         return value
 
     @field_validator("app_timezone")
@@ -83,17 +121,27 @@ class Settings(BaseSettings):
         try:
             ZoneInfo(value)
         except ZoneInfoNotFoundError as error:
-            raise ValueError("APP_TIMEZONE must be a valid IANA time zone") from error
+            raise ValueError(
+                "APP_TIMEZONE must be a valid IANA time zone"
+            ) from error
+
         return value
 
     @model_validator(mode="after")
     def validate_environment(self) -> "Settings":
         if self.app_env not in {"development", "production", "test"}:
-            raise ValueError("APP_ENV must be development, production or test")
+            raise ValueError(
+                "APP_ENV must be development, production or test"
+            )
+
         if self.app_env == "production" and self.telegram_payment_test_mode:
-            raise ValueError("TELEGRAM_PAYMENT_TEST_MODE cannot be enabled in production")
+            raise ValueError(
+                "TELEGRAM_PAYMENT_TEST_MODE cannot be enabled in production"
+            )
+
         if self.app_env == "production" and not self.is_configured:
             raise ValueError("BOT_TOKEN is required in production")
+
         return self
 
     @property
