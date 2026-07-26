@@ -88,3 +88,25 @@ LANGUAGES = {"ru": "🇷🇺 Русский", "en": "🇬🇧 English", "uk": "�
 FREE_GAME_LIMIT = 10
 PREMIUM_GAME_LIMIT = 100
 PREMIUM_PRICES = {1: 100, 3: 270, 12: 900}
+ADMIN_TEST_PREMIUM_CODE = "d1"
+ADMIN_TEST_PREMIUM_DAYS = 1
+ADMIN_TEST_PREMIUM_STARS = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ReferralLevel:
+    key: str
+    active_referrals: int
+    reward_days: int
+    badge: str | None = None
+
+
+REFERRAL_INVITEE_DAYS = 3
+REFERRAL_INVITER_DAYS = 5
+REFERRAL_LEVELS = (
+    ReferralLevel("first", 1, 5),
+    ReferralLevel("five", 5, 10),
+    ReferralLevel("ten", 10, 30),
+    ReferralLevel("ambassador", 25, 90, "ambassador"),
+    ReferralLevel("legend", 50, 365, "legend"),
+)

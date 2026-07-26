@@ -31,6 +31,14 @@ class HistoricalLow:
     occurred_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class ITADHistoryPoint:
+    checked_at: datetime
+    price: Decimal
+    regular_price: Decimal | None
+    currency: str
+
+
 class IsThereAnyDealProvider:
     BASE_URL = "https://api.isthereanydeal.com"
     STEAM_SHOP_ID = 61
@@ -38,6 +46,15 @@ class IsThereAnyDealProvider:
     def __init__(self, client: httpx.AsyncClient, api_key: str) -> None:
         self.client = client
         self.api_key = api_key
+
+    async def search_titles(self, query: str, limit: int = 8) -> list[str]:
+        """Resolve aliases to canonical titles; Steam remains the authority for App IDs."""
+        rows = await self._get("/games/search/v1", title=query, results=limit)
+        return [
+            str(row["title"]).strip()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("title", "")).strip()
+        ]
 
     async def lookup_steam_ids(self, app_ids: list[int]) -> dict[int, str]:
         if not app_ids:
@@ -75,6 +92,40 @@ class IsThereAnyDealProvider:
                 result.append(parsed)
         return result
 
+    async def steam_history(
+        self,
+        game_id: str,
+        country: str,
+        since: datetime | None = None,
+    ) -> list[ITADHistoryPoint]:
+        params: dict[str, object] = {
+            "id": game_id,
+            "country": country,
+            "shops": self.STEAM_SHOP_ID,
+        }
+        if since is not None:
+            params["since"] = since.isoformat()
+        rows = await self._get("/games/history/v2", **params)
+        points: list[ITADHistoryPoint] = []
+        for row in rows:
+            shop = row.get("shop") or {}
+            if shop.get("id") != self.STEAM_SHOP_ID and str(shop.get("name", "")).casefold() != "steam":
+                continue
+            deal = row.get("deal") or {}
+            price = deal.get("price") or {}
+            regular = deal.get("regular") or {}
+            try:
+                checked_at = datetime.fromisoformat(row["timestamp"]).astimezone(UTC)
+                amount = Decimal(str(price["amount"]))
+                currency = str(price["currency"]).upper()
+                regular_amount = Decimal(str(regular["amount"])) if regular.get("amount") is not None else None
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                continue
+            if amount < 0 or len(currency) != 3:
+                continue
+            points.append(ITADHistoryPoint(checked_at, amount, regular_amount, currency))
+        return sorted(points, key=lambda item: item.checked_at)
+
     async def _post(self, path: str, payload: list[str], **params):
         last_error: Exception | None = None
         for attempt in range(2):
@@ -83,6 +134,31 @@ class IsThereAnyDealProvider:
                     self.BASE_URL + path,
                     params=params,
                     json=payload,
+                    headers={"ITAD-API-Key": self.api_key},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as error:
+                last_error = error
+                if error.response.status_code not in {429, 500, 502, 503, 504} or attempt == 1:
+                    break
+            except (httpx.TimeoutException, httpx.RequestError) as error:
+                last_error = error
+                if attempt == 1:
+                    break
+            except ValueError as error:
+                raise ITADError(f"ITAD returned invalid JSON at {path}") from error
+            await asyncio.sleep(0.4 * (attempt + 1))
+        raise ITADError(f"ITAD request failed at {path}") from last_error
+
+    async def _get(self, path: str, **params):
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = await self.client.get(
+                    self.BASE_URL + path,
+                    params=params,
                     headers={"ITAD-API-Key": self.api_key},
                     timeout=10,
                 )

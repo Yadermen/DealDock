@@ -75,3 +75,35 @@ async def test_historical_low_uses_redis_before_database() -> None:
     service = HistoricalLowSync(SimpleNamespace(), ForbiddenFactory(), redis=Redis())
     low = await service.get_low(1, "PL")
     assert low.price == Decimal("79.99") and low.currency == "PLN"
+
+
+@pytest.mark.asyncio
+async def test_price_history_v2_keeps_only_steam() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["shops"] == "61"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "shop": {"id": 61, "name": "Steam"},
+                    "deal": {
+                        "price": {"amount": 19.99, "currency": "PLN"},
+                        "regular": {"amount": 39.99, "currency": "PLN"},
+                    },
+                },
+                {
+                    "timestamp": "2026-01-02T00:00:00+00:00",
+                    "shop": {"id": 35, "name": "GOG"},
+                    "deal": {
+                        "price": {"amount": 10, "currency": "PLN"},
+                        "regular": {"amount": 40, "currency": "PLN"},
+                    },
+                },
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        history = await IsThereAnyDealProvider(client, "secret").steam_history("game-id", "PL")
+    assert len(history) == 1
+    assert history[0].price == Decimal("19.99")

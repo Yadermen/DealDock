@@ -20,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy import (
     text as sql_text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from steam_radar.db.base import Base, TimestampMixin
@@ -72,6 +73,13 @@ class User(TimestampMixin, Base):
     weekly_digest_weekday: Mapped[int] = mapped_column(Integer, default=0)
     weekly_digest_last_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    onboarding_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    referral_code: Mapped[str | None] = mapped_column(String(24), unique=True, index=True)
+    referred_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    referral_badge: Mapped[str | None] = mapped_column(String(32))
+    referral_days_earned: Mapped[int] = mapped_column(Integer, default=0)
     watches: Mapped[list["WatchRule"]] = relationship(back_populates="user", cascade="all, delete")
 
     @property
@@ -83,7 +91,15 @@ class User(TimestampMixin, Base):
 
 class Game(TimestampMixin, Base):
     __tablename__ = "games"
-    __table_args__ = (Index("ix_games_steam_app_id", "steam_app_id"),)
+    __table_args__ = (
+        Index("ix_games_steam_app_id", "steam_app_id"),
+        Index(
+            "ix_games_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     steam_app_id: Mapped[int] = mapped_column(unique=True)
     name: Mapped[str] = mapped_column(String(300), index=True)
@@ -91,6 +107,77 @@ class Game(TimestampMixin, Base):
     game_type: Mapped[str] = mapped_column(String(30), default="game")
     is_free: Mapped[bool] = mapped_column(Boolean, default=False)
     watches: Mapped[list["WatchRule"]] = relationship(back_populates="game")
+
+
+class SteamCatalogApp(TimestampMixin, Base):
+    """Search-only Steam catalogue; never represents a user's tracked game."""
+
+    __tablename__ = "steam_catalog_apps"
+    __table_args__ = (
+        Index(
+            "ix_steam_catalog_apps_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_steam_catalog_apps_search_text_trgm",
+            "search_text",
+            postgresql_using="gin",
+            postgresql_ops={"search_text": "gin_trgm_ops"},
+        ),
+    )
+    steam_app_id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(300))
+    search_text: Mapped[str] = mapped_column(Text)
+
+
+class Referral(Base):
+    __tablename__ = "referrals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    inviter_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    referred_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    referral_code: Mapped[str] = mapped_column(String(24))
+    campaign_key: Mapped[str] = mapped_column(String(50), default="permanent", index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    onboarding_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReferralReward(Base):
+    __tablename__ = "referral_rewards"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "referral_id",
+            "campaign_key",
+            "reward_key",
+            name="uq_referral_reward_once",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    referral_id: Mapped[int | None] = mapped_column(ForeignKey("referrals.id", ondelete="CASCADE"), index=True)
+    reward_key: Mapped[str] = mapped_column(String(50))
+    campaign_key: Mapped[str] = mapped_column(String(50), default="permanent", index=True)
+    premium_days: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ReferralMilestoneAward(Base):
+    __tablename__ = "referral_milestone_awards"
+    __table_args__ = (
+        UniqueConstraint("user_id", "campaign_key", "level_key", name="uq_referral_milestone_once"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    campaign_key: Mapped[str] = mapped_column(String(50), default="permanent")
+    level_key: Mapped[str] = mapped_column(String(50))
+    premium_days: Mapped[int] = mapped_column(Integer)
+    awarded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class WatchRule(TimestampMixin, Base):
@@ -158,6 +245,18 @@ class CurrencyRateCache(Base):
     saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class PriceHistoryCache(Base):
+    __tablename__ = "price_history_cache"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    game_id: Mapped[int] = mapped_column(ForeignKey("games.id", ondelete="CASCADE"), index=True)
+    country_code: Mapped[str] = mapped_column(String(2))
+    currency: Mapped[str] = mapped_column(String(3))
+    source: Mapped[str] = mapped_column(String(32), default="isthereanydeal")
+    payload: Mapped[list[dict]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    __table_args__ = (Index("uq_price_history_game_country", "game_id", "country_code", unique=True),)
+
+
 class Giveaway(TimestampMixin, Base):
     __tablename__ = "giveaways"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -210,6 +309,12 @@ class Payment(Base):
     telegram_charge_id: Mapped[str] = mapped_column(String(200), unique=True)
     amount_stars: Mapped[int]
     months: Mapped[int]
+    duration_days: Mapped[int] = mapped_column(Integer, default=0)
+    tariff: Mapped[str] = mapped_column(String(32), default="premium")
+    status: Mapped[str] = mapped_column(String(20), default="successful", index=True)
+    source: Mapped[str] = mapped_column(String(32), default="telegram_stars")
+    username: Mapped[str | None] = mapped_column(String(64))
+    display_name: Mapped[str | None] = mapped_column(String(128))
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -249,6 +354,17 @@ class PremiumAudit(Base):
     old_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     new_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reason: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class AdminUserAudit(Base):
+    __tablename__ = "admin_user_audits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    field: Mapped[str] = mapped_column(String(32))
+    old_value: Mapped[str | None] = mapped_column(String(500))
+    new_value: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 

@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import TelegramObject
 from sqlalchemy import update
 
@@ -37,9 +37,10 @@ class CommandCleanupMiddleware(BaseMiddleware):
     ) -> Any:
         update = data.get("event_update") or event
         message = getattr(update, "message", None)
+        result = await handler(event, data)
         if message and message.text and message.text.startswith("/"):
             try:
                 await message.delete()
-            except TelegramBadRequest:
+            except (TelegramBadRequest, TelegramForbiddenError):
                 pass
-        return await handler(event, data)
+        return result

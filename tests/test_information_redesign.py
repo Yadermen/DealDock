@@ -7,9 +7,8 @@ from steam_radar.bot.keyboards import info_keyboard, info_page_keyboard, premium
 from steam_radar.constants import FREE_GAME_LIMIT, PREMIUM_GAME_LIMIT, PREMIUM_PRICES
 from steam_radar.i18n import TEXTS, text
 
-
 LANGUAGES = ("ru", "en", "uk", "pl")
-PAGES = ("start", "search", "discounts", "giveaways", "analytics", "region", "premium", "plans")
+PAGES = ("start", "search", "discounts", "giveaways", "analytics", "region", "premium", "plans", "referrals")
 
 
 def callbacks(markup) -> list[str]:
@@ -26,6 +25,7 @@ def test_information_root_opens_every_section(language: str) -> None:
         "info:analytics",
         "info:region",
         "info:premium",
+        "info:referrals",
         "info:start",
         "menu:home",
     ]
@@ -43,9 +43,7 @@ def test_information_pages_have_working_back_navigation(language: str, page: str
 @pytest.mark.parametrize("language", LANGUAGES)
 def test_premium_page_returns_to_origin_and_active_user_has_no_purchase(language: str) -> None:
     free_values = callbacks(info_page_keyboard(language, "premium", premium_back="info:analytics"))
-    active_values = callbacks(
-        info_page_keyboard(language, "premium", is_premium=True, premium_back="info:analytics")
-    )
+    active_values = callbacks(info_page_keyboard(language, "premium", is_premium=True, premium_back="info:analytics"))
     assert "info:analytics" in free_values
     assert any(value.startswith("buy:") for value in free_values)
     assert "info:analytics" in active_values
@@ -68,8 +66,7 @@ def test_dynamic_plan_values_render_without_placeholders(language: str) -> None:
         "premium_frequency": _info_frequency(language, 1),
         "subscription_status": text(language, "info_subscription_free"),
         "plans": "\n".join(
-            text(language, "premium_period", months=months, stars=stars)
-            for months, stars in PREMIUM_PRICES.items()
+            text(language, "premium_period", months=months, stars=stars) for months, stars in PREMIUM_PRICES.items()
         ),
     }
     for key in ("info_premium_page", "info_plans_page"):
@@ -91,3 +88,13 @@ def test_information_localizations_have_identical_placeholders() -> None:
             assert {field for _, field, _, _ in formatter.parse(value) if field} == expected
             assert value.strip()
 
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_referral_information_explains_link_activation_rewards_and_navigation(language: str) -> None:
+    content = text(language, "info_referrals_page")
+    for value in ("3", "5", "10", "25", "50", "90", "365"):
+        assert value in content
+    assert "DealDock" in content
+    assert len(content) <= 4096
+    assert content.count("<b>") == content.count("</b>")
+    assert callbacks(info_page_keyboard(language, "referrals")) == ["menu:info"]

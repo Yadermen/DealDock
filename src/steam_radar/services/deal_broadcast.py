@@ -31,6 +31,7 @@ from steam_radar.db.models import (
 from steam_radar.i18n import text
 from steam_radar.services.monitor import PriceMonitor
 from steam_radar.services.pricing import format_money
+from steam_radar.services.timezones import timezone_from_name
 
 log = structlog.get_logger()
 
@@ -384,7 +385,7 @@ class DealBroadcastService:
         if current:
             chunks.append(current)
         try:
-            zone = ZoneInfo(user.timezone)
+            zone = timezone_from_name(user.timezone)
         except ZoneInfoNotFoundError:
             zone = ZoneInfo("UTC")
         checked = max(item.checked_at for item in deals).astimezone(zone).strftime("%d.%m.%Y, %H:%M %Z")

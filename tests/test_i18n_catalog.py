@@ -29,7 +29,11 @@ def test_unknown_language_and_key_have_safe_fallback() -> None:
 
 def test_polish_catalog_is_complete_and_has_no_cyrillic() -> None:
     assert set(TEXTS["pl"]) == set(TEXTS["ru"])
-    assert not any(any("А" <= char <= "я" or char in "Ёё" for char in value) for value in TEXTS["pl"].values())
+    assert not any(
+        any("А" <= char <= "я" or char in "Ёё" for char in value)
+        for key, value in TEXTS["pl"].items()
+        if key != "welcome_multilingual"
+    )
     assert TEXTS["pl"]["btn_close"] == "✖️ Zamknij"
 
 
@@ -53,6 +57,26 @@ def test_premium_information_is_safe_readable_html_in_every_supported_language()
         assert "━━━━━━━━━━━━━━━━━━" in content
         assert not any(term in normalized for term in forbidden_terms)
         assert not any(value in content for value in ("None", "null", "NaN"))
+
+
+def test_timezone_chooser_is_localized_without_internal_timezone_terms() -> None:
+    expected = {
+        "ru": "Выберите часовой пояс",
+        "en": "Choose your time zone",
+        "pl": "Wybierz strefę czasową",
+        "uk": "Виберіть часовий пояс",
+    }
+    for language, phrase in expected.items():
+        content = text(language, "choose_timezone")
+        assert phrase in content
+        assert "IANA" not in content
+
+
+def test_expired_callback_message_is_localized() -> None:
+    for language in ("ru", "en", "pl", "uk"):
+        content = text(language, "callback_expired")
+        assert content != TEXTS["ru"]["ui_error"]
+        assert content.strip()
 
 
 def test_user_ui_modules_have_no_hardcoded_cyrillic() -> None:

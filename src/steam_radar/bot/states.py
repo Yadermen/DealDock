@@ -5,6 +5,13 @@ class Onboarding(StatesGroup):
     language = State()
     region_group = State()
     region = State()
+    timezone_group = State()
+    timezone = State()
+    manual_timezone = State()
+
+
+class TimezoneSetup(StatesGroup):
+    manual = State()
 
 
 class QuietHoursSetup(StatesGroup):
@@ -64,3 +71,7 @@ class AdminBroadcast(StatesGroup):
 
 class AdminGameRefresh(StatesGroup):
     app_id = State()
+
+
+class AdminUserEdit(StatesGroup):
+    value = State()

@@ -13,15 +13,14 @@ class Settings(BaseSettings):
     )
 
     bot_token: str = ""
-    database_url: str = (
-        "postgresql+asyncpg://steam_radar:steam_radar@localhost/steam_radar"
-    )
+    database_url: str = "postgresql+asyncpg://steam_radar:steam_radar@localhost/steam_radar"
     redis_url: str = "redis://localhost:6379/0"
     admin_ids: frozenset[int] = Field(default_factory=frozenset)
     log_level: str = "INFO"
     free_check_hours: int = 24
     premium_check_hours: int = 1
     steam_request_delay: float = 1.0
+    steam_web_api_key: str = ""
     app_timezone: str = "Europe/Warsaw"
     app_env: str = "development"
     telegram_payment_test_mode: bool = False
@@ -41,16 +40,14 @@ class Settings(BaseSettings):
     backup_dir: str = "backups"
     itad_api_key: str = ""
     itad_sync_hours: int = 24
+    rawg_api_key: str = ""
+    steam_catalog_sync_hours: int = 24
 
     @field_validator("admin_ids", mode="before")
     @classmethod
     def parse_admin_ids(cls, value: object) -> frozenset[int]:
         if isinstance(value, str):
-            return frozenset(
-                int(item.strip())
-                for item in value.split(",")
-                if item.strip()
-            )
+            return frozenset(int(item.strip()) for item in value.split(",") if item.strip())
 
         return frozenset(value or [])
 
@@ -91,6 +88,7 @@ class Settings(BaseSettings):
         "backup_interval_hours",
         "backup_retention_days",
         "itad_sync_hours",
+        "steam_catalog_sync_hours",
     )
     @classmethod
     def positive_integer(cls, value: int) -> int:
@@ -121,23 +119,17 @@ class Settings(BaseSettings):
         try:
             ZoneInfo(value)
         except ZoneInfoNotFoundError as error:
-            raise ValueError(
-                "APP_TIMEZONE must be a valid IANA time zone"
-            ) from error
+            raise ValueError("APP_TIMEZONE must be a valid IANA time zone") from error
 
         return value
 
     @model_validator(mode="after")
     def validate_environment(self) -> "Settings":
         if self.app_env not in {"development", "production", "test"}:
-            raise ValueError(
-                "APP_ENV must be development, production or test"
-            )
+            raise ValueError("APP_ENV must be development, production or test")
 
         if self.app_env == "production" and self.telegram_payment_test_mode:
-            raise ValueError(
-                "TELEGRAM_PAYMENT_TEST_MODE cannot be enabled in production"
-            )
+            raise ValueError("TELEGRAM_PAYMENT_TEST_MODE cannot be enabled in production")
 
         if self.app_env == "production" and not self.is_configured:
             raise ValueError("BOT_TOKEN is required in production")

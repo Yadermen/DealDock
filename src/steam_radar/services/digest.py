@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfoNotFoundError
 
 from aiogram import Bot
 from sqlalchemy import func, select
@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from steam_radar.db.models import NotificationLog, User
 from steam_radar.i18n import text
+from steam_radar.services.timezones import timezone_from_name
 
 
 class DigestService:
@@ -46,7 +47,7 @@ class DigestService:
     @staticmethod
     def _due(user: User, now: datetime, kind: str = "daily") -> bool:
         try:
-            local = now.astimezone(ZoneInfo(user.timezone))
+            local = now.astimezone(timezone_from_name(user.timezone))
         except ZoneInfoNotFoundError:
             local = now
         enabled = getattr(user, f"{kind}_digest_enabled", False)

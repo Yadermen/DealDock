@@ -23,13 +23,20 @@ from steam_radar.services.backup import create_backup
 from steam_radar.services.currency import CurrencyService
 from steam_radar.services.deal_broadcast import DealBroadcastService
 from steam_radar.services.digest import DigestService
+from steam_radar.services.game_search import GameSearchService
 from steam_radar.services.giveaway_notifications import GiveawayNotificationService
 from steam_radar.services.giveaways import GamerPowerProvider
 from steam_radar.services.itad import HistoricalLowSync, IsThereAnyDealProvider
 from steam_radar.services.monitor import PriceMonitor
 from steam_radar.services.premium import PremiumService
+from steam_radar.services.price_analysis import PriceAnalyticsService
+from steam_radar.services.price_chart import PriceChartService
+from steam_radar.services.price_history import PriceHistoryService
+from steam_radar.services.rawg import RawgSearchProvider
+from steam_radar.services.referrals import ReferralService
 from steam_radar.services.runtime import HealthServer, PollingLock
 from steam_radar.services.steam import SteamProvider
+from steam_radar.services.steam_catalog import SteamCatalogService
 from steam_radar.services.sync import SyncCoordinator
 
 
@@ -62,23 +69,34 @@ async def main() -> None:
     polling_lock = PollingLock(redis, lock_key, settings.polling_lock_ttl)
     if not await polling_lock.acquire():
         raise RuntimeError("Another polling instance is already running for this bot token")
+    bot_info = await bot.get_me()
+    if not bot_info.supports_inline_queries:
+        structlog.get_logger().warning(
+            "telegram_inline_mode_disabled",
+            instruction="Open @BotFather, run /setinline, select this bot, and set an inline placeholder.",
+        )
 
     async with httpx.AsyncClient(
         timeout=15,
-        headers={"User-Agent": "SteamRadar/0.1"},
+        headers={"User-Agent": "DealDock/0.1"},
         trust_env=False,
     ) as client:
         steam = SteamProvider(redis, client)
+        itad_provider = IsThereAnyDealProvider(client, settings.itad_api_key) if settings.itad_api_key else None
+        rawg = RawgSearchProvider(client, settings.rawg_api_key, steam) if settings.rawg_api_key else None
+        steam_catalog = SteamCatalogService(client, redis, session_factory, settings.steam_web_api_key)
+        game_search = GameSearchService(session_factory, steam, itad_provider, rawg)
         currency = CurrencyService(redis, client, session_factory=session_factory)
-        monitor = PriceMonitor(bot, session_factory, steam, settings)
+        monitor = PriceMonitor(bot, session_factory, steam, settings, currency)
         giveaway_provider = GamerPowerProvider(client)
         sync = SyncCoordinator(redis, session_factory, monitor, giveaway_provider)
         premium_service = PremiumService(bot, session_factory)
+        referral_service = ReferralService(bot, session_factory)
         digest_service = DigestService(bot, session_factory)
         deal_broadcast_service = DealBroadcastService(bot, session_factory, redis, settings)
         historical_lows = (
             HistoricalLowSync(
-                IsThereAnyDealProvider(client, settings.itad_api_key),
+                itad_provider,
                 session_factory,
                 settings.itad_sync_hours,
                 redis,
@@ -86,6 +104,9 @@ async def main() -> None:
             if settings.itad_api_key
             else None
         )
+        price_history = PriceHistoryService(itad_provider, session_factory, redis, currency)
+        price_analytics = PriceAnalyticsService()
+        price_charts = PriceChartService(redis)
         giveaway_notifications = GiveawayNotificationService(bot, session_factory)
         scheduler = create_scheduler(
             monitor,
@@ -94,6 +115,8 @@ async def main() -> None:
             digest_service,
             historical_lows,
             giveaway_notifications,
+            steam_catalog,
+            settings.steam_catalog_sync_hours,
         )
         if settings.backup_enabled:
 
@@ -112,6 +135,7 @@ async def main() -> None:
         health = HealthServer(settings.health_host, settings.health_port, session_factory, redis, scheduler)
         await health.start()
         initial_sync = asyncio.create_task(sync.full_sync(), name="initial-sync")
+        initial_catalog_sync = asyncio.create_task(steam_catalog.sync(), name="initial-steam-catalog-sync")
         initial_historical_sync = (
             asyncio.create_task(historical_lows.run(), name="initial-historical-low-sync") if historical_lows else None
         )
@@ -135,13 +159,20 @@ async def main() -> None:
                 session_factory=session_factory,
                 redis=redis,
                 steam=steam,
+                game_search=game_search,
                 currency=currency,
                 historical_lows=historical_lows,
+                price_history=price_history,
+                price_analytics=price_analytics,
+                price_charts=price_charts,
+                referral_service=referral_service,
                 sync=sync,
             )
         finally:
             if not initial_sync.done():
                 initial_sync.cancel()
+            if not initial_catalog_sync.done():
+                initial_catalog_sync.cancel()
             if initial_historical_sync and not initial_historical_sync.done():
                 initial_historical_sync.cancel()
             scheduler.shutdown(wait=False)

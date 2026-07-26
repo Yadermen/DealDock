@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -6,13 +7,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputMediaPhoto,
+    InputTextMessageContent,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
@@ -48,15 +54,19 @@ from steam_radar.bot.keyboards import (
     invoice_keyboard,
     language_keyboard,
     main_keyboard,
+    manual_timezone_keyboard,
     minute_keyboard,
     premium_filters_keyboard,
     premium_games_keyboard,
     premium_gate_keyboard,
     premium_info_return_keyboard,
     premium_keyboard,
+    price_history_keyboard,
     profile_currency_keyboard,
     profile_keyboard,
     quiet_hours_keyboard,
+    referral_leaderboard_keyboard,
+    referrals_keyboard,
     region_groups_keyboard,
     region_keyboard,
     rule_keyboard,
@@ -66,26 +76,45 @@ from steam_radar.bot.keyboards import (
     watch_list_keyboard,
     weekday_keyboard,
 )
-from steam_radar.bot.states import AddGame, DealsFilterSetup, EditWatch, Onboarding, PremiumFilterSetup, RegionCompare
+from steam_radar.bot.states import (
+    AddGame,
+    DealsFilterSetup,
+    EditWatch,
+    Onboarding,
+    PremiumFilterSetup,
+    RegionCompare,
+    TimezoneSetup,
+)
 from steam_radar.config import Settings
 from steam_radar.constants import (
+    ADMIN_TEST_PREMIUM_CODE,
+    ADMIN_TEST_PREMIUM_DAYS,
+    ADMIN_TEST_PREMIUM_STARS,
     COMPARISON_CURRENCIES,
     FREE_GAME_LIMIT,
     LANGUAGES,
     MAX_COMPARISON_REGIONS,
     PREMIUM_GAME_LIMIT,
     PREMIUM_PRICES,
+    REFERRAL_LEVELS,
     REGIONS,
 )
 from steam_radar.db.models import ExternalHistoricalLow, Game, Giveaway, Payment, Plan, PriceSnapshot, User, WatchRule
 from steam_radar.db.repositories import get_or_create_game, get_or_create_user, get_user, watch_count
 from steam_radar.i18n import text
-from steam_radar.services.analytics import AnalyticsSnapshot, build_price_analytics_card, calculate_purchase_score
+from steam_radar.services.analytics import AnalyticsSnapshot, calculate_purchase_score
+from steam_radar.services.condition_currency import convert_user_money_conditions
 from steam_radar.services.currency import CurrencyError, CurrencyService, ExchangeRates
+from steam_radar.services.game_search import GameSearchService
 from steam_radar.services.itad import HistoricalLowSync, ITADError
+from steam_radar.services.price_analysis import PriceAnalyticsService
+from steam_radar.services.price_chart import PriceChartService
+from steam_radar.services.price_history import PriceHistoryService
 from steam_radar.services.pricing import NormalizedPrice, format_money, format_price_card
+from steam_radar.services.referrals import ReferralDashboard, ReferralService
 from steam_radar.services.region_comparison import CachedRegionalPrice, RegionalPriceComparison
 from steam_radar.services.steam import SteamError, SteamGame, SteamPrice, SteamProvider
+from steam_radar.services.timezones import normalize_utc_offset, timezone_from_name
 
 router = Router(name="user")
 log = structlog.get_logger()
@@ -143,17 +172,27 @@ def _info_frequency(language: str, hours: int) -> str:
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext, session_factory: async_sessionmaker) -> None:
+async def start(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    referral_service: ReferralService,
+) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    referral_code = parts[1].strip() if len(parts) == 2 else None
     async with session_factory() as session:
+        existing = await get_user(session, message.from_user.id)
         user = await get_or_create_user(
             session, message.from_user.id, message.from_user.username, message.from_user.full_name
         )
+        if existing is None:
+            await referral_service.register_pending(session, user, referral_code)
         await session.commit()
         if user.language_code and user.country_code:
             await message.answer(text(user.language_code, "menu"), reply_markup=main_keyboard(user.language_code))
             return
     await state.set_state(Onboarding.language)
-    await message.answer(text("ru", "welcome"), reply_markup=language_keyboard())
+    await message.answer(text("ru", "welcome_multilingual"), reply_markup=language_keyboard())
 
 
 @router.callback_query(Onboarding.language, F.data.startswith("lang:"))
@@ -162,7 +201,8 @@ async def choose_language(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(language=language)
     await state.set_state(Onboarding.region_group)
     await callback.message.edit_text(
-        text(language, "choose_region_group"), reply_markup=region_groups_keyboard(language)
+        text(language, "choose_region_group"),
+        reply_markup=region_groups_keyboard(language, onboarding=True),
     )
     await callback.answer()
 
@@ -177,7 +217,8 @@ async def choose_onboarding_region_group(callback: CallbackQuery, state: FSMCont
         return
     await state.set_state(Onboarding.region)
     await callback.message.edit_text(
-        text(language, "choose_region"), reply_markup=region_keyboard(language, group=group)
+        text(language, "choose_region"),
+        reply_markup=region_keyboard(language, group=group, onboarding=True),
     )
     await callback.answer()
 
@@ -188,7 +229,8 @@ async def onboarding_region_groups(callback: CallbackQuery, state: FSMContext) -
     language = data.get("language", "ru")
     await state.set_state(Onboarding.region_group)
     await callback.message.edit_text(
-        text(language, "choose_region_group"), reply_markup=region_groups_keyboard(language)
+        text(language, "choose_region_group"),
+        reply_markup=region_groups_keyboard(language, onboarding=True),
     )
     await callback.answer()
 
@@ -201,19 +243,137 @@ async def choose_region(callback: CallbackQuery, state: FSMContext, session_fact
     if country not in REGIONS:
         await callback.answer(text(language, "invalid_value"), show_alert=True)
         return
+    await state.update_data(country=country)
+    await state.set_state(Onboarding.timezone_group)
+    await callback.message.edit_text(
+        text(language, "onboarding_timezone_prompt"),
+        reply_markup=timezone_groups_keyboard(language, onboarding=True),
+    )
+    await callback.answer()
+
+
+@router.callback_query(Onboarding.timezone_group, F.data.startswith("timezone_group:"))
+async def choose_onboarding_timezone_group(callback: CallbackQuery, state: FSMContext) -> None:
+    group = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    if group not in {region.geo_group for region in REGIONS.values()}:
+        await callback.answer(text(language, "invalid_value"), show_alert=True)
+        return
+    await state.set_state(Onboarding.timezone)
+    await callback.message.edit_text(
+        text(language, "choose_timezone"),
+        reply_markup=timezone_keyboard(language, group, onboarding=True),
+    )
+    await callback.answer()
+
+
+async def _finish_onboarding(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    timezone_name: str,
+    referral_service: ReferralService,
+) -> None:
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    country = data.get("country")
+    if country not in REGIONS:
+        await callback.answer(text(language, "invalid_value"), show_alert=True)
+        return
     async with session_factory() as session:
         user = await get_or_create_user(
-            session, callback.from_user.id, callback.from_user.username, callback.from_user.full_name
+            session,
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name,
         )
-        user.language_code, user.country_code = language, country
-        user.timezone = REGIONS[country].timezone
+        user.language_code = language
+        user.country_code = country
+        user.timezone = timezone_name
+        await referral_service.mark_onboarding_completed(session, user)
         await session.commit()
     await state.clear()
     await callback.message.edit_text(
-        text(language, "ready", region=text(language, f"region_{country.lower()}")),
+        text(
+            language,
+            "ready_with_timezone",
+            region=text(language, f"region_{country.lower()}"),
+            timezone=timezone_name,
+        ),
         reply_markup=main_keyboard(language),
     )
     await callback.answer()
+
+
+@router.callback_query(Onboarding.timezone, F.data.startswith("timezone:"))
+async def choose_onboarding_timezone(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    referral_service: ReferralService,
+) -> None:
+    timezone_name = callback.data.split(":", 1)[1]
+    if timezone_name not in {region.timezone for region in REGIONS.values()}:
+        data = await state.get_data()
+        await callback.answer(text(data.get("language", "ru"), "invalid_value"), show_alert=True)
+        return
+    await _finish_onboarding(callback, state, session_factory, timezone_name, referral_service)
+
+
+@router.callback_query(Onboarding.timezone, F.data == "timezone_groups")
+async def onboarding_timezone_groups(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    await state.set_state(Onboarding.timezone_group)
+    await callback.message.edit_text(
+        text(language, "onboarding_timezone_prompt"),
+        reply_markup=timezone_groups_keyboard(language, onboarding=True),
+    )
+    await callback.answer()
+
+
+@router.callback_query(Onboarding.timezone_group, F.data == "timezone:manual")
+@router.callback_query(Onboarding.timezone, F.data == "timezone:manual")
+async def onboarding_manual_timezone(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    await state.set_state(Onboarding.manual_timezone)
+    await state.update_data(
+        timezone_prompt_chat_id=callback.message.chat.id,
+        timezone_prompt_message_id=callback.message.message_id,
+    )
+    await callback.message.edit_text(
+        text(language, "timezone_manual_prompt"),
+        reply_markup=manual_timezone_keyboard(language, onboarding=True),
+    )
+    await callback.answer()
+
+
+@router.callback_query(Onboarding.manual_timezone, F.data == "onboarding:timezone")
+async def onboarding_manual_timezone_back(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    await state.set_state(Onboarding.timezone_group)
+    await callback.message.edit_text(
+        text(language, "onboarding_timezone_prompt"),
+        reply_markup=timezone_groups_keyboard(language, onboarding=True),
+    )
+    await callback.answer()
+
+
+@router.callback_query(Onboarding.timezone_group, F.data == "onboarding:cancel")
+@router.callback_query(Onboarding.timezone, F.data == "onboarding:cancel")
+@router.callback_query(Onboarding.manual_timezone, F.data == "onboarding:cancel")
+async def onboarding_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    language = data.get("language", "ru")
+    await state.set_state(Onboarding.timezone_group)
+    await callback.message.edit_text(
+        text(language, "onboarding_timezone_prompt"),
+        reply_markup=timezone_groups_keyboard(language, onboarding=True),
+    )
+    await callback.answer(text(language, "onboarding_required"), show_alert=True)
 
 
 @router.callback_query(F.data == "ui:close")
@@ -221,15 +381,22 @@ async def close_current_message(callback: CallbackQuery) -> None:
     await callback.answer()
     try:
         await callback.message.delete()
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
 
 
 @router.message(Command("menu"))
-async def menu(message: Message, session_factory: async_sessionmaker) -> None:
+async def menu(message: Message, state: FSMContext, session_factory: async_sessionmaker) -> None:
     async with session_factory() as session:
         user = await _user(session, message.from_user.id)
     language = user.language_code if user else "ru"
+    if not user or not user.language_code or not user.country_code:
+        await state.set_state(Onboarding.language)
+        await message.answer(
+            text(language, "onboarding_required") + "\n\n" + text("ru", "welcome_multilingual"),
+            reply_markup=language_keyboard(),
+        )
+        return
     await message.answer(text(language, "menu"), reply_markup=main_keyboard(language))
 
 
@@ -316,11 +483,205 @@ async def terms_command(message: Message, session_factory: async_sessionmaker) -
 
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, state: FSMContext, session_factory: async_sessionmaker) -> None:
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("Onboarding:"):
+        data = await state.get_data()
+        language = data.get("language", "ru")
+        if current_state == Onboarding.language.state:
+            await callback.message.edit_text(
+                text(language, "onboarding_required") + "\n\n" + text("ru", "welcome_multilingual"),
+                reply_markup=language_keyboard(),
+            )
+        elif current_state in {Onboarding.region_group.state, Onboarding.region.state}:
+            await state.set_state(Onboarding.region_group)
+            await callback.message.edit_text(
+                text(language, "choose_region_group"),
+                reply_markup=region_groups_keyboard(language, onboarding=True),
+            )
+        else:
+            await state.set_state(Onboarding.timezone_group)
+            await callback.message.edit_text(
+                text(language, "onboarding_timezone_prompt"),
+                reply_markup=timezone_groups_keyboard(language, onboarding=True),
+            )
+        await callback.answer(text(language, "onboarding_required"), show_alert=True)
+        return
     await state.clear()
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
     language = user.language_code if user else "ru"
     await callback.message.edit_text(text(language, "menu"), reply_markup=main_keyboard(language))
+    await callback.answer()
+
+
+def _referral_progress(language: str, dashboard: ReferralDashboard) -> str:
+    level = dashboard.next_level
+    if level is None:
+        return text(language, "referral_progress_complete")
+    filled = min(10, int(dashboard.active / level.active_referrals * 10))
+    bar = "█" * filled + "░" * (10 - filled)
+    remaining = level.active_referrals - dashboard.active
+    return text(
+        language,
+        "referral_progress_next",
+        bar=bar,
+        current=dashboard.active,
+        target=level.active_referrals,
+        remaining=remaining,
+        days=level.reward_days,
+        level=text(language, f"referral_level_{level.key}"),
+    )
+
+def _referral_levels(language: str, dashboard: ReferralDashboard) -> str:
+    lines: list[str] = []
+    for level in REFERRAL_LEVELS:
+        marker = "✅" if level.key in dashboard.awarded_levels else (
+            "👉" if dashboard.next_level and level.key == dashboard.next_level.key else "▫️"
+        )
+        badge = text(language, f"referral_badge_{level.badge}").strip() if level.badge else ""
+        lines.append(
+            text(
+                language,
+                "referral_level_row",
+                marker=marker,
+                target=level.active_referrals,
+                days=level.reward_days,
+                badge=badge,
+                level=text(language, f"referral_level_{level.key}"),
+            )
+        )
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "menu:referrals")
+async def referrals_screen(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    referral_service: ReferralService,
+) -> None:
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+    language = user.language_code if user else "ru"
+    dashboard = await referral_service.dashboard(callback.from_user.id)
+    if dashboard is None:
+        await callback.answer(text(language, "profile_missing"), show_alert=True)
+        return
+    link = await referral_service.referral_link(dashboard.code)
+    content = text(
+        language,
+        "referral_screen",
+        invited=dashboard.invited,
+        active=dashboard.active,
+        days=dashboard.earned_days,
+        link=link,
+        progress=_referral_progress(language, dashboard),
+        levels=_referral_levels(language, dashboard),
+    )
+    await callback.message.edit_text(
+        content,
+        reply_markup=referrals_keyboard(language, dashboard.code),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+@router.inline_query(F.query.startswith("ref:"))
+async def referral_inline_query(query: InlineQuery, referral_service: ReferralService) -> None:
+    code = query.query.split(":", 1)[1].strip()
+    try:
+        invitation = await referral_service.inline_invitation(query.from_user.id, code)
+    except Exception:
+        log.exception("referral_inline_query_failed", telegram_id=query.from_user.id)
+        invitation = None
+    if invitation is None:
+        language = query.from_user.language_code if query.from_user.language_code in LANGUAGES else "ru"
+        unavailable = InlineQueryResultArticle(
+            id="referral-unavailable",
+            title=text(language, "referral_inline_unavailable_title"),
+            description=text(language, "referral_inline_unavailable_description"),
+            input_message_content=InputTextMessageContent(
+                message_text=text(language, "referral_inline_unavailable_message"),
+                parse_mode="HTML",
+            ),
+        )
+        await query.answer([unavailable], cache_time=0, is_personal=True)
+        return
+    language, referral_link = invitation
+    result = InlineQueryResultArticle(
+        id=f"referral-{code}",
+        title=text(language, "referral_inline_result_title"),
+        description=text(language, "referral_inline_result_description"),
+        input_message_content=InputTextMessageContent(
+            message_text=text(language, "referral_inline_message"),
+            parse_mode="HTML",
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=text(language, "btn_referral_start"),
+                        url=referral_link,
+                    )
+                ]
+            ]
+        ),
+    )
+    await query.answer([result], cache_time=0, is_personal=True)
+
+
+@router.callback_query(F.data.startswith("referral:leaderboard"))
+async def referral_leaderboard(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    referral_service: ReferralService,
+) -> None:
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+    language = user.language_code if user else "ru"
+    entries, outside = await referral_service.leaderboard(callback.from_user.id)
+    try:
+        requested_page = int(callback.data.rsplit(":", 1)[1]) if callback.data.count(":") == 2 else 0
+    except ValueError:
+        requested_page = 0
+    page_size = 20
+    pages = max(1, (len(entries) + page_size - 1) // page_size)
+    page = min(max(0, requested_page), pages - 1)
+    visible_entries = entries[page * page_size : (page + 1) * page_size]
+    lines = [text(language, "referral_leaderboard_title")]
+    if not entries:
+        lines.append(text(language, "referral_leaderboard_empty"))
+    else:
+        for entry in visible_entries:
+            badge = text(language, f"referral_badge_{entry.badge}") if entry.badge else ""
+            lines.append(
+                text(
+                    language,
+                    "referral_leaderboard_row",
+                    position=entry.position,
+                    name=escape(entry.display_name[:24]),
+                    active=entry.active_referrals,
+                    badge=badge,
+                )
+            )
+    lines.append(text(language, "pagination", page=page + 1, pages=pages))
+    if outside and page + 1 == pages:
+        lines.extend(
+            [
+                text(language, "referral_leaderboard_your_position"),
+                text(
+                    language,
+                    "referral_leaderboard_row",
+                    position=outside.position,
+                    name=escape(outside.display_name[:32]),
+                    active=outside.active_referrals,
+                    badge=text(language, f"referral_badge_{outside.badge}") if outside.badge else "",
+                ),
+            ]
+        )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=referral_leaderboard_keyboard(language, page, pages),
+    )
     await callback.answer()
 
 
@@ -341,12 +702,15 @@ async def search_start(callback: CallbackQuery, state: FSMContext, session_facto
 
 @router.message(AddGame.query)
 async def search_game(
-    message: Message, state: FSMContext, session_factory: async_sessionmaker, steam: SteamProvider
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    game_search: GameSearchService,
 ) -> None:
     async with session_factory() as session:
         user = await _user(session, message.from_user.id)
     try:
-        games = await steam.search(
+        games = await game_search.search(
             message.text or "", _steam_country(user.country_code), _steam_language(user.language_code)
         )
     except (SteamError, ValueError):
@@ -402,11 +766,12 @@ async def select_rule(
     state: FSMContext,
     session_factory: async_sessionmaker,
     steam: SteamProvider,
+    referral_service: ReferralService,
 ) -> None:
     rule = callback.data.split(":", 1)[1]
     await state.update_data(rule=rule)
     if rule == "any":
-        await _save_watch(callback, state, session_factory, steam, min_discount=1)
+        await _save_watch(callback, state, session_factory, steam, referral_service, min_discount=1)
         return
     await state.set_state(AddGame.value)
     async with session_factory() as session:
@@ -449,7 +814,11 @@ async def search_results(callback: CallbackQuery, state: FSMContext, session_fac
 
 @router.message(AddGame.value)
 async def rule_value(
-    message: Message, state: FSMContext, session_factory: async_sessionmaker, steam: SteamProvider
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    steam: SteamProvider,
+    referral_service: ReferralService,
 ) -> None:
     data = await state.get_data()
     try:
@@ -457,12 +826,12 @@ async def rule_value(
             value = int(message.text or "")
             if not 1 <= value <= 100:
                 raise ValueError
-            await _save_watch(message, state, session_factory, steam, min_discount=value)
+            await _save_watch(message, state, session_factory, steam, referral_service, min_discount=value)
         else:
             value = Decimal((message.text or "").replace(",", "."))
             if value <= 0:
                 raise ValueError
-            await _save_watch(message, state, session_factory, steam, max_price=value)
+            await _save_watch(message, state, session_factory, steam, referral_service, max_price=value)
     except (ValueError, InvalidOperation):
         language = await _language(session_factory, message.from_user.id)
         await _replace_panel(message, state, text(language, "invalid_value"), back_keyboard("games", language))
@@ -473,6 +842,7 @@ async def _save_watch(
     state: FSMContext,
     session_factory: async_sessionmaker,
     steam: SteamProvider,
+    referral_service: ReferralService,
     min_discount: int | None = None,
     max_price: Decimal | None = None,
 ) -> None:
@@ -534,6 +904,8 @@ async def _save_watch(
         await session.commit()
         language = user.language_code
         rule_id, app_id, game_name = rule.id, game.steam_app_id, game.name
+        user_id = user.id
+    await referral_service.activate_if_eligible(user_id)
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(
             format_price_card(game_name, _normalized(price), language)
@@ -1064,7 +1436,11 @@ async def change_language(callback: CallbackQuery, session_factory: async_sessio
 
 @router.callback_query(F.data.startswith("region:"))
 async def change_region(
-    callback: CallbackQuery, session_factory: async_sessionmaker, steam: SteamProvider, settings: Settings
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    steam: SteamProvider,
+    currency: CurrencyService,
+    settings: Settings,
 ) -> None:
     country = callback.data.split(":", 1)[1]
     async with session_factory() as session:
@@ -1074,6 +1450,19 @@ async def change_region(
             return
         if country not in REGIONS:
             await callback.answer(text(user.language_code, "invalid_value"), show_alert=True)
+            return
+        old_currency = REGIONS[user.country_code].currency
+        new_currency = REGIONS[country].currency
+        try:
+            converted = await convert_user_money_conditions(
+                session,
+                currency,
+                user.id,
+                old_currency,
+                new_currency,
+            )
+        except CurrencyError:
+            await callback.answer(text(user.language_code, "condition_conversion_failed"), show_alert=True)
             return
         user.country_code = country
         await session.commit()
@@ -1085,6 +1474,8 @@ async def change_region(
         "region_changed",
         region=text(user.language_code, f"region_{country.lower()}"),
     )
+    if converted:
+        content += "\n" + text(user.language_code, "conditions_converted", currency=new_currency)
     await callback.message.edit_text(content, reply_markup=markup)
 
 
@@ -1126,6 +1517,125 @@ async def settings_timezone(callback: CallbackQuery, session_factory: async_sess
         text(language, "choose_timezone_group"), reply_markup=timezone_groups_keyboard(language)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "timezone:manual")
+async def settings_manual_timezone(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+) -> None:
+    language = await _language(session_factory, callback.from_user.id)
+    await state.set_state(TimezoneSetup.manual)
+    await state.update_data(
+        timezone_prompt_chat_id=callback.message.chat.id,
+        timezone_prompt_message_id=callback.message.message_id,
+        language=language,
+    )
+    await callback.message.edit_text(
+        text(language, "timezone_manual_prompt"),
+        reply_markup=manual_timezone_keyboard(language),
+    )
+    await callback.answer()
+
+
+@router.message(Onboarding.manual_timezone)
+@router.message(TimezoneSetup.manual)
+async def save_manual_timezone(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker,
+    settings: Settings,
+    referral_service: ReferralService,
+) -> None:
+    data = await state.get_data()
+    language = data.get("language") or await _language(session_factory, message.from_user.id)
+    prompt_chat_id = data.get("timezone_prompt_chat_id", message.chat.id)
+    prompt_message_id = data.get("timezone_prompt_message_id")
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+    normalized = normalize_utc_offset(message.text or "")
+    if normalized is None:
+        markup = manual_timezone_keyboard(
+            language,
+            onboarding=await state.get_state() == Onboarding.manual_timezone.state,
+        )
+        if prompt_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    text(language, "timezone_manual_invalid"),
+                    chat_id=prompt_chat_id,
+                    message_id=prompt_message_id,
+                    reply_markup=markup,
+                )
+                return
+            except TelegramBadRequest as error:
+                if "message is not modified" in str(error).lower():
+                    return
+        sent = await message.bot.send_message(
+            prompt_chat_id,
+            text(language, "timezone_manual_invalid"),
+            reply_markup=markup,
+        )
+        await state.update_data(timezone_prompt_chat_id=sent.chat.id, timezone_prompt_message_id=sent.message_id)
+        return
+    if await state.get_state() == Onboarding.manual_timezone.state:
+        country = data.get("country")
+        if country not in REGIONS:
+            await state.clear()
+            await message.answer(text(language, "invalid_value"))
+            return
+        async with session_factory() as session:
+            user = await get_or_create_user(
+                session,
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.full_name,
+            )
+            user.language_code = language
+            user.country_code = country
+            user.timezone = normalized
+            await referral_service.mark_onboarding_completed(session, user)
+            await session.commit()
+        await state.clear()
+        content = text(
+            language,
+            "ready_with_timezone",
+            region=text(language, f"region_{country.lower()}"),
+            timezone=normalized,
+        )
+        if prompt_message_id:
+            await message.bot.edit_message_text(
+                content,
+                chat_id=prompt_chat_id,
+                message_id=prompt_message_id,
+                reply_markup=main_keyboard(language),
+            )
+        else:
+            await message.bot.send_message(prompt_chat_id, content, reply_markup=main_keyboard(language))
+        return
+    async with session_factory() as session:
+        user = await _user(session, message.from_user.id)
+        if user is None:
+            await state.clear()
+            await message.answer(text(language, "profile_missing"))
+            return
+        user.timezone = normalized
+        await session.commit()
+    await state.clear()
+    content, markup = _profile_screen(user, settings.app_timezone)
+    content += "\n\n" + text(language, "timezone_changed", timezone=normalized)
+    if prompt_message_id:
+        await message.bot.edit_message_text(
+            content,
+            chat_id=prompt_chat_id,
+            message_id=prompt_message_id,
+            reply_markup=markup,
+        )
+    else:
+        await message.bot.send_message(prompt_chat_id, content, reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("timezone_group:"))
@@ -1188,22 +1698,41 @@ async def information_currency(callback: CallbackQuery, session_factory: async_s
 
 
 @router.callback_query(F.data.startswith("settings_currency:"))
-async def information_currency_save(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
-    currency = callback.data.split(":", 1)[1]
+async def information_currency_save(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    currency: CurrencyService,
+) -> None:
+    currency_code = callback.data.split(":", 1)[1]
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
         language = user.language_code if user and user.language_code else "ru"
-        if not user or currency not in COMPARISON_CURRENCIES:
+        if not user or currency_code not in COMPARISON_CURRENCIES:
             await callback.answer(text(language, "invalid_value"), show_alert=True)
             return
-        user.comparison_currency = currency
+        source_default = REGIONS[user.country_code].currency
+        try:
+            converted = await convert_user_money_conditions(
+                session,
+                currency,
+                user.id,
+                source_default,
+                currency_code,
+            )
+        except CurrencyError:
+            await callback.answer(text(language, "condition_conversion_failed"), show_alert=True)
+            return
+        user.comparison_currency = currency_code
         await session.commit()
     await _safe_edit_callback(
         callback,
         text(language, "info_region_page"),
         info_page_keyboard(language, "region"),
     )
-    await callback.answer(text(language, "info_currency_saved", currency=currency))
+    confirmation = text(language, "info_currency_saved", currency=currency_code)
+    if converted:
+        confirmation += "\n" + text(language, "conditions_converted", currency=currency_code)
+    await callback.answer(confirmation)
 
 
 @router.callback_query(F.data.startswith("info:"))
@@ -1225,6 +1754,7 @@ async def information_page(
         "analytics": "info_analytics_page",
         "premium": "info_premium_page",
         "region": "info_region_page",
+        "referrals": "info_referrals_page",
         "start": "info_start_page",
         "plans": "info_plans_page",
     }.get(page)
@@ -1256,6 +1786,7 @@ async def information_page(
             language,
             page,
             is_premium=bool(user and user.is_premium),
+            is_admin=callback.from_user.id in settings.admin_ids,
             premium_back=back_callback,
         ),
     )
@@ -1516,43 +2047,92 @@ async def premium(callback: CallbackQuery, session_factory: async_sessionmaker, 
     async with session_factory() as session:
         user = await _user(session, callback.from_user.id)
         tracked = await watch_count(session, user.id) if user else 0
-    content, keyboard = _premium_screen(user, user.language_code, settings.telegram_payment_test_mode, tracked)
+    content, keyboard = _premium_screen(
+        user,
+        user.language_code,
+        settings.telegram_payment_test_mode,
+        tracked,
+        is_admin=callback.from_user.id in settings.admin_ids,
+    )
     await callback.message.edit_text(content, reply_markup=keyboard)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("premium:info"))
-async def premium_info(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+async def premium_info(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    settings: Settings,
+) -> None:
     language = await _language(session_factory, callback.from_user.id)
     parts = callback.data.split(":", 2)
     back_callback = parts[2] if len(parts) == 3 and parts[2] else "menu:premium"
     await _safe_edit_callback(
         callback,
         text(language, "premium_full_info"),
-        premium_info_return_keyboard(language, back_callback),
+        premium_info_return_keyboard(
+            language,
+            back_callback,
+            is_admin=callback.from_user.id in settings.admin_ids,
+        ),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("buy:"))
-async def buy_premium(callback: CallbackQuery, bot: Bot, session_factory: async_sessionmaker) -> None:
-    _, months, stars = callback.data.split(":")
+async def buy_premium(
+    callback: CallbackQuery,
+    bot: Bot,
+    session_factory: async_sessionmaker,
+    settings: Settings,
+) -> None:
+    try:
+        _, tariff_code, raw_stars = callback.data.split(":")
+        stars = int(raw_stars)
+    except (ValueError, AttributeError):
+        await callback.answer(text("ru", "payment_invalid"), show_alert=True)
+        return
     language = await _language(session_factory, callback.from_user.id)
+    purchase = _parse_premium_payload(
+        f"premium:{tariff_code}",
+        stars,
+        allow_admin_test=callback.from_user.id in settings.admin_ids,
+    )
+    if purchase is None:
+        await callback.answer(text(language, "payment_invalid"), show_alert=True)
+        return
+    title = (
+        text(language, "premium_invoice_title_days", days=purchase.days)
+        if purchase.months == 0
+        else text(language, "premium_invoice_title", months=purchase.months)
+    )
     await bot.send_invoice(
         chat_id=callback.from_user.id,
-        title=text(language, "premium_invoice_title", months=months),
+        title=title,
         description=text(language, "premium_invoice_description"),
-        payload=f"premium:{months}",
+        payload=f"premium:{tariff_code}",
         currency="XTR",
-        prices=[LabeledPrice(label="Premium", amount=int(stars))],
-        reply_markup=invoice_keyboard(language, int(stars)),
+        prices=[LabeledPrice(label="Premium", amount=stars)],
+        reply_markup=invoice_keyboard(language, stars),
     )
     await callback.answer()
 
 
 @router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery, session_factory: async_sessionmaker) -> None:
-    valid = query.currency == "XTR" and _parse_premium_payload(query.invoice_payload, query.total_amount) is not None
+async def pre_checkout(
+    query: PreCheckoutQuery,
+    session_factory: async_sessionmaker,
+    settings: Settings,
+) -> None:
+    valid = (
+        query.currency == "XTR"
+        and _parse_premium_payload(
+            query.invoice_payload,
+            query.total_amount,
+            allow_admin_test=query.from_user.id in settings.admin_ids,
+        )
+        is not None
+    )
     language = await _language(session_factory, query.from_user.id)
     await query.answer(ok=valid, error_message=None if valid else text(language, "payment_invalid"))
 
@@ -1560,8 +2140,12 @@ async def pre_checkout(query: PreCheckoutQuery, session_factory: async_sessionma
 @router.message(F.successful_payment)
 async def payment_success(message: Message, session_factory: async_sessionmaker, settings: Settings) -> None:
     payment = message.successful_payment
-    months = _parse_premium_payload(payment.invoice_payload, payment.total_amount)
-    if payment.currency != "XTR" or months is None:
+    purchase = _parse_premium_payload(
+        payment.invoice_payload,
+        payment.total_amount,
+        allow_admin_test=message.from_user.id in settings.admin_ids,
+    )
+    if payment.currency != "XTR" or purchase is None:
         await message.answer(text(await _language(session_factory, message.from_user.id), "payment_rejected"))
         return
     async with session_factory() as session:
@@ -1575,7 +2159,13 @@ async def payment_success(message: Message, session_factory: async_sessionmaker,
                 user_id=user.id,
                 telegram_charge_id=payment.telegram_payment_charge_id,
                 amount_stars=payment.total_amount,
-                months=months,
+                months=purchase.months,
+                duration_days=purchase.days,
+                tariff="admin_test_day" if purchase.months == 0 else f"premium_{purchase.months}m",
+                status="successful",
+                source="telegram_stars_test" if settings.telegram_payment_test_mode else "telegram_stars",
+                username=user.username,
+                display_name=user.display_name,
                 paid_at=datetime.now(UTC),
                 is_test=settings.telegram_payment_test_mode,
             )
@@ -1587,16 +2177,20 @@ async def payment_success(message: Message, session_factory: async_sessionmaker,
             await message.answer(text(user.language_code, "payment_duplicate"))
             return
         base = user.premium_until if user.is_premium else datetime.now(UTC)
-        # Calendar precision is not required for access checks; a billing month is 30 days here.
         user.plan = Plan.PREMIUM
         user.premium_source = "telegram_stars_test" if settings.telegram_payment_test_mode else "telegram_stars"
         if not user.is_premium:
             user.premium_started_at = datetime.now(UTC)
         user.premium_expired_notified_at = None
-        user.premium_until = base + timedelta(days=30 * months)
+        user.premium_until = base + timedelta(days=purchase.days)
         await session.commit()
     await message.answer(
-        text(user.language_code, "payment_success", months=months),
+        text(
+            user.language_code,
+            "payment_success_days" if purchase.months == 0 else "payment_success",
+            months=purchase.months,
+            days=purchase.days,
+        ),
         reply_markup=dismiss_keyboard(user.language_code),
     )
 
@@ -1617,10 +2211,11 @@ async def premium_history(callback: CallbackQuery, session_factory: async_sessio
         items = "\n".join(
             text(
                 language,
-                "payment_history_item",
+                "payment_history_item_days" if p.months == 0 else "payment_history_item",
                 date=p.paid_at.strftime("%d.%m.%Y"),
                 stars=p.amount_stars,
                 months=p.months,
+                days=ADMIN_TEST_PREMIUM_DAYS,
                 test=text(language, "test_suffix") if p.is_test else "",
             )
             for p in payments
@@ -1638,7 +2233,10 @@ async def premium_manage(callback: CallbackQuery, session_factory: async_session
     content = text(language, "premium")
     if settings.telegram_payment_test_mode:
         content += "\n\n" + text(language, "premium_test_label")
-    await callback.message.edit_text(content, reply_markup=premium_keyboard(language))
+    await callback.message.edit_text(
+        content,
+        reply_markup=premium_keyboard(language, is_admin=callback.from_user.id in settings.admin_ids),
+    )
     await callback.answer()
 
 
@@ -1686,10 +2284,12 @@ async def premium_game_analytics(
     redis: Redis,
     steam: SteamProvider,
     historical_lows: HistoricalLowSync | None,
+    price_history: PriceHistoryService,
+    price_analytics: PriceAnalyticsService,
+    currency: CurrencyService,
 ) -> None:
     rule_id = int(callback.data.rsplit(":", 1)[1])
     refresh = callback.data.startswith("analytics_refresh:")
-    detailed = callback.data.startswith("analytics_details:")
     if callback.data.startswith("deals_analytics:"):
         await redis.set(f"analytics:origin:{callback.from_user.id}", "deals:return", ex=3600)
     elif callback.data.startswith("premium_analytics:"):
@@ -1764,52 +2364,363 @@ async def premium_game_analytics(
                 )
             ).all()
         )
-        external = None
-        if historical_lows is None:
-            external = await session.scalar(
-                select(ExternalHistoricalLow).where(
-                    ExternalHistoricalLow.game_id == rule.game_id,
-                    ExternalHistoricalLow.country_code == country,
-                    ExternalHistoricalLow.scope == "steam",
-                )
-            )
-    if historical_lows is not None:
-        external = await historical_lows.get_low(rule.game_id, country, "steam")
     snapshots.reverse()
-    try:
-        zone = ZoneInfo(user.timezone)
-    except ZoneInfoNotFoundError:
-        zone = ZoneInfo("UTC")
-    card = build_price_analytics_card(
+    if not snapshots:
+        await _safe_edit_callback(
+            callback,
+            text(language, "premium_history_insufficient"),
+            back_keyboard("games", language),
+        )
+        if not refresh:
+            await callback.answer()
+        return
+    latest = snapshots[-1]
+    analysis_target = rule.max_price
+    if analysis_target is not None and rule.target_currency not in {None, latest.currency}:
+        try:
+            analysis_target, _ = await currency.convert(
+                analysis_target,
+                rule.target_currency,
+                latest.currency,
+            )
+        except CurrencyError:
+            analysis_target = None
+    history_result = await price_history.get_history(
+        rule.game_id,
+        rule.game.steam_app_id,
+        country,
+        latest.currency,
+        None,
+    )
+    analysis = price_analytics.analyze(
+        history_result.points,
+        latest.final_price,
+        latest.initial_price,
+        latest.discount_percent,
+        analysis_target,
+        rule.min_discount,
+    )
+    content = price_analytics.build_card(
         language,
         rule.game.name,
-        [
-            AnalyticsSnapshot(
-                item.final_price,
-                item.initial_price,
-                item.currency,
-                item.checked_at.astimezone(zone),
-            )
-            for item in snapshots
-        ],
-        external.price if external else None,
-        external.currency if external else None,
-        external.updated_at if external else None,
-        datetime.now(zone),
-        detailed=detailed,
+        latest.currency,
+        analysis,
+        analysis_target,
+        rule.min_discount,
     )
     origin = await redis.get(f"analytics:origin:{callback.from_user.id}")
-    await callback.message.edit_text(
-        card.content,
-        reply_markup=analytics_keyboard(
+    await _safe_edit_callback(
+        callback,
+        content,
+        analytics_keyboard(
             language,
             rule.id,
-            detailed=detailed,
+            rule.game.steam_app_id,
             back_callback=origin or f"watch:{rule.id}",
         ),
     )
     if not refresh:
         await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price_history:"))
+async def premium_price_history(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker,
+    redis: Redis,
+    price_history: PriceHistoryService,
+    price_analytics: PriceAnalyticsService,
+    price_charts: PriceChartService,
+    currency: CurrencyService,
+) -> None:
+    try:
+        _, rule_value, period_value = (callback.data or "").split(":", 2)
+        rule_id = int(rule_value)
+        period_days = None if period_value == "all" else int(period_value)
+        if period_days not in {None, 7, 30, 90, 365}:
+            raise ValueError
+    except (TypeError, ValueError):
+        await callback.answer(text("ru", "stale_callback"), show_alert=True)
+        return
+
+    async with session_factory() as session:
+        user = await _user(session, callback.from_user.id)
+        language = user.language_code if user else "ru"
+        rule = await session.scalar(
+            select(WatchRule)
+            .options(selectinload(WatchRule.game))
+            .where(WatchRule.id == rule_id, WatchRule.user_id == getattr(user, "id", 0))
+        )
+        if user is None or rule is None:
+            await callback.answer(text(language, "game_missing"), show_alert=True)
+            return
+        if not user.is_premium:
+            await _show_premium_gate(callback, language, f"watch:{rule_id}")
+            return
+        latest = await session.scalar(
+            select(PriceSnapshot)
+            .where(PriceSnapshot.game_id == rule.game_id, PriceSnapshot.country_code == user.country_code)
+            .order_by(PriceSnapshot.checked_at.desc())
+            .limit(1)
+        )
+
+    if latest is None:
+        await callback.answer(text(language, "premium_history_insufficient"), show_alert=True)
+        return
+    await callback.answer()
+    message_type = "photo" if isinstance(callback.message, Message) and callback.message.photo else "text"
+    try:
+        if isinstance(callback.message, Message) and callback.message.photo:
+            await callback.message.edit_caption(
+                caption=text(language, "premium_history_loading"),
+                reply_markup=None,
+            )
+        elif isinstance(callback.message, Message):
+            await callback.message.edit_text(text(language, "premium_history_loading"))
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            log.warning(
+                "price_history_loading_state_failed",
+                callback_data=callback.data,
+                user_id=callback.from_user.id,
+                game_id=rule.game_id,
+                app_id=rule.game.steam_app_id,
+                period=period_value,
+                country=user.country_code,
+                currency=latest.currency,
+                message_type=message_type,
+                message_id=getattr(callback.message, "message_id", None),
+                error_type=type(error).__name__,
+                exc_info=True,
+            )
+    try:
+        full_history = await price_history.get_history(
+            rule.game_id,
+            rule.game.steam_app_id,
+            user.country_code,
+            latest.currency,
+            None,
+        )
+        history = (
+            full_history
+            if period_days is None
+            else await price_history.get_history(
+                rule.game_id,
+                rule.game.steam_app_id,
+                user.country_code,
+                latest.currency,
+                period_days,
+            )
+        )
+    except Exception:
+        log.exception(
+            "price_history_data_failed",
+            callback_data=callback.data,
+            user_id=callback.from_user.id,
+            game_id=rule.game_id,
+            app_id=rule.game.steam_app_id,
+            period=period_value,
+            country=user.country_code,
+            currency=latest.currency,
+            source="itad_or_fallback",
+            points=0,
+            message_type=message_type,
+            message_id=getattr(callback.message, "message_id", None),
+        )
+        await _safe_edit_callback(
+            callback,
+            text(language, "premium_history_error"),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=text(language, "btn_back"),
+                            callback_data=f"premium_analytics:{rule.id}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+    if not history.points:
+        await _safe_edit_callback(
+            callback,
+            text(language, "premium_history_insufficient"),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=text(language, "btn_back"),
+                            callback_data=f"premium_analytics:{rule.id}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+    analysis_target = rule.max_price
+    if analysis_target is not None and rule.target_currency not in {None, latest.currency}:
+        try:
+            analysis_target, _ = await currency.convert(
+                analysis_target,
+                rule.target_currency,
+                latest.currency,
+            )
+        except CurrencyError:
+            analysis_target = None
+    overall_analysis = price_analytics.analyze(
+        full_history.points,
+        latest.final_price,
+        latest.initial_price,
+        latest.discount_percent,
+        analysis_target,
+        rule.min_discount,
+    )
+    period_analysis = price_analytics.analyze(
+        history.points,
+        latest.final_price,
+        latest.initial_price,
+        latest.discount_percent,
+        analysis_target,
+        rule.min_discount,
+    )
+    analysis = replace(
+        period_analysis,
+        historical_low=overall_analysis.historical_low,
+        historical_low_at=overall_analysis.historical_low_at,
+        historical_low_discount=overall_analysis.historical_low_discount,
+        low_difference=overall_analysis.low_difference,
+        low_difference_percent=overall_analysis.low_difference_percent,
+    )
+    period_key = "all" if period_days is None else str(period_days)
+    try:
+        chart = await price_charts.render(
+            points=history.points,
+            currency=latest.currency,
+            regular_price=latest.initial_price,
+            historical_low=analysis.historical_low,
+            target_price=analysis_target,
+            labels={
+                "title": text(language, "chart_title"),
+                "price": text(language, "chart_price"),
+                "regular": text(language, "chart_regular"),
+                "low": text(language, "chart_low"),
+                "target": text(language, "chart_target"),
+                "axis_price": text(language, "chart_axis_price", currency=latest.currency),
+                "locale": language,
+            },
+            cache_identity=f"{rule.game.steam_app_id}:{period_key}",
+        )
+    except Exception:
+        log.exception(
+            "price_history_chart_failed",
+            callback_data=callback.data,
+            user_id=callback.from_user.id,
+            game_id=rule.game_id,
+            app_id=rule.game.steam_app_id,
+            period=period_key,
+            country=user.country_code,
+            currency=latest.currency,
+            source=history.source,
+            points=len(history.points),
+            message_type=message_type,
+            message_id=getattr(callback.message, "message_id", None),
+        )
+        await _safe_edit_callback(
+            callback,
+            text(language, "premium_history_error"),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=text(language, "btn_back"),
+                            callback_data=f"premium_analytics:{rule.id}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+    if chart is None:
+        await _safe_edit_callback(
+            callback,
+            text(language, "premium_history_insufficient"),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=text(language, "btn_back"),
+                            callback_data=f"premium_analytics:{rule.id}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+    caption = price_analytics.build_history_summary(
+        language,
+        latest.currency,
+        analysis,
+        period_key,
+        history.source,
+    )
+    media = InputMediaPhoto(
+        media=BufferedInputFile(chart, filename=f"price-history-{rule.game.steam_app_id}.png"),
+        caption=caption,
+        parse_mode="HTML",
+    )
+    markup = price_history_keyboard(language, rule.id, period_key)
+    try:
+        if isinstance(callback.message, Message) and callback.message.photo:
+            updated = await callback.message.edit_media(media=media, reply_markup=markup)
+        else:
+            if isinstance(callback.message, Message):
+                try:
+                    await callback.message.delete()
+                except TelegramBadRequest:
+                    pass
+            updated = await callback.bot.send_photo(
+                callback.from_user.id,
+                media.media,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        await redis.set(
+            f"price_history:message:{callback.from_user.id}:{rule.id}",
+            str(updated.message_id),
+            ex=86400,
+        )
+        log.info(
+            "price_history_screen_rendered",
+            callback_data=callback.data,
+            user_id=callback.from_user.id,
+            game_id=rule.game_id,
+            app_id=rule.game.steam_app_id,
+            period=period_key,
+            country=user.country_code,
+            currency=latest.currency,
+            source=history.source,
+            points=len(history.points),
+            message_type="photo",
+            message_id=updated.message_id,
+        )
+    except Exception:
+        log.exception(
+            "price_history_screen_failed",
+            callback_data=callback.data,
+            user_id=callback.from_user.id,
+            game_id=rule.game_id,
+            app_id=rule.game.steam_app_id,
+            period=period_key,
+            country=user.country_code,
+            currency=latest.currency,
+            source=history.source,
+            points=len(history.points),
+            message_type=message_type,
+            message_id=getattr(callback.message, "message_id", None),
+        )
+        await callback.bot.send_message(callback.from_user.id, text(language, "ui_error"))
 
 
 @router.callback_query(F.data.startswith("premium_compare:"))
@@ -2159,7 +3070,7 @@ async def premium_region_compare_result(
     if comparison.unconverted:
         missing = ", ".join(text(language, REGIONS[c].translation_key) for c in comparison.unconverted)
         warnings.append(text(language, "compare_conversion_missing", regions=missing))
-    updated = rates_info.updated_at.astimezone(ZoneInfo(user.timezone)).strftime("%d.%m.%Y %H:%M %Z")
+    updated = rates_info.updated_at.astimezone(timezone_from_name(user.timezone)).strftime("%d.%m.%Y %H:%M %Z")
     content = text(
         language,
         "compare_result",
@@ -2729,18 +3640,32 @@ async def deals_filter_value_save(
     await state.clear()
 
 
+@router.callback_query()
+async def expired_callback(callback: CallbackQuery, session_factory: async_sessionmaker) -> None:
+    """Always stop Telegram's spinner for stale buttons left after a deployment."""
+    language = await _language(session_factory, callback.from_user.id)
+    await callback.answer(text(language, "callback_expired"), show_alert=True)
+
+
 @router.error()
-async def error_handler(event) -> bool:
+async def error_handler(event, session_factory: async_sessionmaker) -> bool:
+    callback = getattr(event.update, "callback_query", None)
+    message = getattr(event.update, "message", None)
+    telegram_user = getattr(callback or message, "from_user", None)
+    language = await _language(session_factory, telegram_user.id) if telegram_user is not None else "ru"
     log.error(
         "telegram_update_failed",
         error=str(event.exception),
         exception_type=type(event.exception).__name__,
+        user_id=getattr(telegram_user, "id", None),
+        language=language,
+        callback_data=getattr(callback, "data", None),
+        message_id=getattr(getattr(callback, "message", None) or message, "message_id", None),
         exc_info=(type(event.exception), event.exception, event.exception.__traceback__),
     )
-    callback = getattr(event.update, "callback_query", None)
     if callback is not None:
         try:
-            await callback.answer(text("ru", "ui_error"), show_alert=True)
+            await callback.answer(text(language, "ui_error"), show_alert=True)
         except TelegramBadRequest:
             pass
     return True
@@ -2752,7 +3677,7 @@ def _profile_screen(user: User, timezone_name: str) -> tuple[str, InlineKeyboard
     created_at = getattr(user, "created_at", None) or datetime.now(UTC)
     user_timezone = getattr(user, "timezone", None) or timezone_name
     try:
-        zone = ZoneInfo(user_timezone)
+        zone = timezone_from_name(user_timezone, timezone_name)
         registered = created_at.astimezone(zone).strftime("%d.%m.%Y")
     except (ZoneInfoNotFoundError, AttributeError):
         registered = created_at.strftime("%d.%m.%Y")
@@ -2777,13 +3702,18 @@ def _profile_screen(user: User, timezone_name: str) -> tuple[str, InlineKeyboard
 
 
 def _premium_screen(
-    user: User | None, language: str, test_mode: bool, tracked: int = 0
+    user: User | None,
+    language: str,
+    test_mode: bool,
+    tracked: int = 0,
+    *,
+    is_admin: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     if user and user.is_premium and user.premium_until:
         now = datetime.now(UTC)
         remaining_label = _premium_remaining(language, user.premium_until - now)
         try:
-            zone = ZoneInfo(getattr(user, "timezone", "UTC"))
+            zone = timezone_from_name(getattr(user, "timezone", "UTC"))
         except (ZoneInfoNotFoundError, TypeError):
             zone = ZoneInfo("UTC")
         started = (user.premium_started_at or user.created_at).astimezone(zone).strftime("%d.%m.%Y %H:%M")
@@ -2795,11 +3725,11 @@ def _premium_screen(
             remaining=remaining_label,
             tracked=tracked,
         )
-        return content, active_premium_keyboard(language)
+        return content, active_premium_keyboard(language, is_admin=is_admin)
     content = text(language, "premium")
     if test_mode:
         content += "\n\n" + text(language, "premium_test_label")
-    return content, premium_keyboard(language)
+    return content, premium_keyboard(language, is_admin=is_admin)
 
 
 def _premium_remaining(language: str, remaining: timedelta) -> str:
@@ -2871,6 +3801,11 @@ async def _safe_edit_callback(callback: CallbackQuery, content: str, markup: Inl
             chat_id=message.chat.id,
             message_id=message.message_id,
         )
+        if message.photo or message.document:
+            try:
+                await message.delete()
+            except TelegramBadRequest:
+                pass
         await callback.bot.send_message(message.chat.id, content, reply_markup=markup)
 
 
@@ -2914,7 +3849,7 @@ def _watch_card_content(rule: WatchRule, latest: PriceSnapshot | None, user: Use
     updated = ""
     if latest is not None:
         try:
-            local_checked = latest.checked_at.astimezone(ZoneInfo(user.timezone))
+            local_checked = latest.checked_at.astimezone(timezone_from_name(user.timezone))
             updated = "\n" + text(
                 user.language_code, "last_updated", date=f"{local_checked:%d.%m.%Y %H:%M} {user.timezone}"
             )
@@ -2951,7 +3886,7 @@ def _updated_label(value: str | None, timezone_name: str, language: str = "ru") 
     if not value:
         return "\n\n" + text(language, "never_updated")
     try:
-        zone = ZoneInfo(timezone_name)
+        zone = timezone_from_name(timezone_name)
         localized = datetime.fromisoformat(value).astimezone(zone)
         offset = localized.strftime("%z")
         offset_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC"
@@ -3006,15 +3941,36 @@ async def _refresh_user_prices(
     return updated, failed
 
 
-def _parse_premium_payload(payload: str, amount: int) -> int | None:
+@dataclass(frozen=True)
+class PremiumPurchase:
+    months: int
+    days: int
+    stars: int
+
+
+def _parse_premium_payload(
+    payload: str,
+    amount: int,
+    *,
+    allow_admin_test: bool = False,
+) -> PremiumPurchase | None:
     try:
-        prefix, raw_months = payload.split(":", 1)
-        months = int(raw_months)
+        prefix, tariff_code = payload.split(":", 1)
     except (ValueError, AttributeError):
         return None
-    if prefix != "premium" or PREMIUM_PRICES.get(months) != amount:
+    if prefix != "premium":
         return None
-    return months
+    if tariff_code == ADMIN_TEST_PREMIUM_CODE:
+        if not allow_admin_test or amount != ADMIN_TEST_PREMIUM_STARS:
+            return None
+        return PremiumPurchase(months=0, days=ADMIN_TEST_PREMIUM_DAYS, stars=amount)
+    try:
+        months = int(tariff_code)
+    except ValueError:
+        return None
+    if PREMIUM_PRICES.get(months) != amount:
+        return None
+    return PremiumPurchase(months=months, days=30 * months, stars=amount)
 
 
 async def _replace_panel(message: Message, state: FSMContext, content: str, reply_markup) -> None:

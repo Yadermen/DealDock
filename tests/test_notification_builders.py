@@ -62,12 +62,12 @@ def test_saving_and_observed_minimum_wording_are_honest() -> None:
     assert "Historical minimum" not in content
 
 
-def test_premium_keyboard_has_analysis_and_correct_steam_url() -> None:
+def test_premium_notification_has_only_steam_and_close() -> None:
     keyboard = notification_keyboard("en", 252490, rule_id=7, premium=True)
     buttons = [button for row in keyboard.inline_keyboard for button in row]
-    assert any(button.url == "https://store.steampowered.com/app/252490" for button in buttons)
-    assert any(button.callback_data == "premium_analytics:7" for button in buttons)
-    assert any(button.callback_data == "ui:close" for button in buttons)
+    assert len(buttons) == 2
+    assert buttons[0].url == "https://store.steampowered.com/app/252490"
+    assert buttons[1].callback_data == "ui:close"
 
 
 @pytest.mark.asyncio

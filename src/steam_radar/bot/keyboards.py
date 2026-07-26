@@ -1,6 +1,15 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, SwitchInlineQueryChosenChat
 
-from steam_radar.constants import COMPARISON_CURRENCIES, LANGUAGES, PREMIUM_PRICES, REGION_GROUPS, REGIONS
+from steam_radar.constants import (
+    ADMIN_TEST_PREMIUM_CODE,
+    ADMIN_TEST_PREMIUM_DAYS,
+    ADMIN_TEST_PREMIUM_STARS,
+    COMPARISON_CURRENCIES,
+    LANGUAGES,
+    PREMIUM_PRICES,
+    REGION_GROUPS,
+    REGIONS,
+)
 from steam_radar.db.models import GiveawayKind, User, WatchRule
 from steam_radar.i18n import text
 from steam_radar.services.steam import SteamGame
@@ -31,6 +40,19 @@ def dismiss_keyboard(language: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[dismiss_button(language)]])
 
 
+def broadcast_dismiss_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=text(language, "btn_broadcast_close"),
+                    callback_data="ui:close",
+                )
+            ]
+        ]
+    )
+
+
 def _compact_rows(buttons: list[InlineKeyboardButton], width: int = 3) -> list[list[InlineKeyboardButton]]:
     if any(len(button.text) > 16 for button in buttons):
         width = 2
@@ -38,21 +60,31 @@ def _compact_rows(buttons: list[InlineKeyboardButton], width: int = 3) -> list[l
 
 
 def region_groups_keyboard(
-    language: str = "ru", back: bool = False, prefix: str = "region_group"
+    language: str = "ru",
+    back: bool = False,
+    prefix: str = "region_group",
+    *,
+    onboarding: bool = False,
 ) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=text(language, f"region_group_{group}"), callback_data=f"{prefix}:{group}")]
         for group in REGION_GROUPS
         if any(region.geo_group == group for region in REGIONS.values())
     ]
-    if back:
+    if back and not onboarding:
         rows.append([InlineKeyboardButton(text=text(language, "btn_back"), callback_data="menu:settings")])
-    rows.append([close_button(language)])
+    if not onboarding:
+        rows.append([close_button(language)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def region_keyboard(
-    language: str = "ru", back: bool = False, group: str | None = None, prefix: str = "region"
+    language: str = "ru",
+    back: bool = False,
+    group: str | None = None,
+    prefix: str = "region",
+    group_back: bool = True,
+    onboarding: bool = False,
 ) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(text=text(language, f"region_{code.lower()}"), callback_data=f"region:{code}")
@@ -60,11 +92,13 @@ def region_keyboard(
         if group is None or region.geo_group == group
     ]
     rows = _compact_rows(buttons)
-    if group:
-        rows.append([InlineKeyboardButton(text=text(language, "btn_back_groups"), callback_data=f"{prefix}_groups")])
-    elif back:
+    if group and group_back:
+        back_key = "btn_back_region_list" if onboarding else "btn_back_groups"
+        rows.append([InlineKeyboardButton(text=text(language, back_key), callback_data=f"{prefix}_groups")])
+    elif back and not onboarding:
         rows.append([InlineKeyboardButton(text=text(language, "btn_back"), callback_data="menu:settings")])
-    rows.append([close_button(language)])
+    if not onboarding:
+        rows.append([close_button(language)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -91,29 +125,102 @@ def main_keyboard(language: str = "ru") -> InlineKeyboardMarkup:
         ]
         for i in range(0, 6, 2)
     ]
+    rows.append([InlineKeyboardButton(text=text(language, "btn_referrals"), callback_data="menu:referrals")])
     rows.append([InlineKeyboardButton(text=text(language, "btn_info"), callback_data="menu:info")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def timezone_groups_keyboard(language: str) -> InlineKeyboardMarkup:
+def referrals_keyboard(language: str, referral_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=text(language, "btn_referral_share"),
+                    switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+                        query=f"ref:{referral_code}",
+                        allow_user_chats=True,
+                        allow_bot_chats=False,
+                        allow_group_chats=True,
+                        allow_channel_chats=False,
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=text(language, "btn_referral_leaderboard"),
+                    callback_data="referral:leaderboard",
+                )
+            ],
+            [InlineKeyboardButton(text=text(language, "btn_back"), callback_data="menu:home")],
+        ]
+    )
+
+
+def referral_leaderboard_keyboard(language: str, page: int = 0, pages: int = 1) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(text=text(language, "btn_previous"), callback_data=f"referral:leaderboard:{page - 1}")
+        )
+    if page + 1 < pages:
+        navigation.append(
+            InlineKeyboardButton(text=text(language, "btn_next"), callback_data=f"referral:leaderboard:{page + 1}")
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text=text(language, "btn_back"), callback_data="menu:referrals")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def timezone_groups_keyboard(language: str, *, onboarding: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=text(language, f"region_group_{group}"), callback_data=f"timezone_group:{group}")]
         for group in REGION_GROUPS
         if any(region.geo_group == group for region in REGIONS.values())
     ]
-    rows.append([InlineKeyboardButton(text=text(language, "btn_menu"), callback_data="menu:home")])
+    rows.append([InlineKeyboardButton(text=text(language, "timezone_manual_button"), callback_data="timezone:manual")])
+    if not onboarding:
+        rows.append([InlineKeyboardButton(text=text(language, "btn_menu"), callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def timezone_keyboard(language: str, group: str | None = None) -> InlineKeyboardMarkup:
+def timezone_keyboard(language: str, group: str | None = None, *, onboarding: bool = False) -> InlineKeyboardMarkup:
     zones = list(
         dict.fromkeys(region.timezone for region in REGIONS.values() if group is None or region.geo_group == group)
     )
     buttons = [InlineKeyboardButton(text=zone, callback_data=f"timezone:{zone}") for zone in zones]
     rows = _compact_rows(buttons, 2)
-    rows.append([InlineKeyboardButton(text=text(language, "btn_back_groups"), callback_data="timezone_groups")])
-    rows.append([InlineKeyboardButton(text=text(language, "btn_menu"), callback_data="menu:home")])
+    rows.append([InlineKeyboardButton(text=text(language, "timezone_manual_button"), callback_data="timezone:manual")])
+    back_key = "btn_back_timezone_list" if onboarding else "btn_back_groups"
+    rows.append([InlineKeyboardButton(text=text(language, back_key), callback_data="timezone_groups")])
+    if not onboarding:
+        rows.append([InlineKeyboardButton(text=text(language, "btn_menu"), callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def manual_timezone_keyboard(language: str, *, onboarding: bool = False) -> InlineKeyboardMarkup:
+    if onboarding:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=text(language, "btn_back_timezone_list"),
+                        callback_data="onboarding:timezone",
+                    )
+                ]
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=text(language, "btn_cancel"),
+                    callback_data="settings:timezone",
+                )
+            ]
+        ]
+    )
 
 
 def info_keyboard(language: str) -> InlineKeyboardMarkup:
@@ -125,6 +232,7 @@ def info_keyboard(language: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=text(language, "info_analytics"), callback_data="info:analytics")],
             [InlineKeyboardButton(text=text(language, "info_region"), callback_data="info:region")],
             [InlineKeyboardButton(text=text(language, "info_premium"), callback_data="info:premium")],
+            [InlineKeyboardButton(text=text(language, "info_referrals"), callback_data="info:referrals")],
             [InlineKeyboardButton(text=text(language, "info_getting_started"), callback_data="info:start")],
             [InlineKeyboardButton(text=text(language, "btn_menu"), callback_data="menu:home")],
         ]
@@ -136,6 +244,7 @@ def info_page_keyboard(
     page: str | None = None,
     *,
     is_premium: bool = False,
+    is_admin: bool = False,
     premium_back: str = "menu:info",
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
@@ -200,6 +309,20 @@ def info_page_keyboard(
                 [InlineKeyboardButton(text=text(language, "btn_manage_subscription"), callback_data="menu:premium")]
             )
         else:
+            if is_admin:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=text(
+                                language,
+                                "premium_test_period",
+                                days=ADMIN_TEST_PREMIUM_DAYS,
+                                stars=ADMIN_TEST_PREMIUM_STARS,
+                            ),
+                            callback_data=f"buy:{ADMIN_TEST_PREMIUM_CODE}:{ADMIN_TEST_PREMIUM_STARS}",
+                        )
+                    ]
+                )
             rows.extend(
                 [
                     [
@@ -311,11 +434,26 @@ def watch_card_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def premium_keyboard(language: str = "ru") -> InlineKeyboardMarkup:
+def premium_keyboard(language: str = "ru", *, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=text(language, "premium_period", months=m, stars=s), callback_data=f"buy:{m}:{s}")]
         for m, s in PREMIUM_PRICES.items()
     ]
+    if is_admin:
+        rows.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text=text(
+                        language,
+                        "premium_test_period",
+                        days=ADMIN_TEST_PREMIUM_DAYS,
+                        stars=ADMIN_TEST_PREMIUM_STARS,
+                    ),
+                    callback_data=f"buy:{ADMIN_TEST_PREMIUM_CODE}:{ADMIN_TEST_PREMIUM_STARS}",
+                )
+            ],
+        )
     rows.append([menu_button(language)])
     rows.append([InlineKeyboardButton(text=text(language, "btn_premium_info"), callback_data="premium:info")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -331,11 +469,26 @@ def premium_info_keyboard(language: str = "ru") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def premium_info_return_keyboard(language: str, back_callback: str) -> InlineKeyboardMarkup:
+def premium_info_return_keyboard(language: str, back_callback: str, *, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=text(language, "premium_period", months=m, stars=s), callback_data=f"buy:{m}:{s}")]
         for m, s in PREMIUM_PRICES.items()
     ]
+    if is_admin:
+        rows.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text=text(
+                        language,
+                        "premium_test_period",
+                        days=ADMIN_TEST_PREMIUM_DAYS,
+                        stars=ADMIN_TEST_PREMIUM_STARS,
+                    ),
+                    callback_data=f"buy:{ADMIN_TEST_PREMIUM_CODE}:{ADMIN_TEST_PREMIUM_STARS}",
+                )
+            ],
+        )
     rows.append([InlineKeyboardButton(text=text(language, "btn_back"), callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -349,28 +502,64 @@ def invoice_keyboard(language: str, stars: int) -> InlineKeyboardMarkup:
     )
 
 
-def active_premium_keyboard(language: str = "ru") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=text(language, "btn_price_analytics"), callback_data="premium:analytics")],
-            [InlineKeyboardButton(text=text(language, "btn_region_compare"), callback_data="premium:compare")],
-            [InlineKeyboardButton(text=text(language, "btn_manage_subscription"), callback_data="premium:manage")],
-            [InlineKeyboardButton(text=text(language, "btn_payment_history"), callback_data="premium:history")],
-            [InlineKeyboardButton(text=text(language, "btn_premium_info"), callback_data="premium:info")],
-            [menu_button(language)],
-        ]
-    )
+def active_premium_keyboard(language: str = "ru", *, is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=text(language, "btn_price_analytics"), callback_data="premium:analytics")],
+        [InlineKeyboardButton(text=text(language, "btn_region_compare"), callback_data="premium:compare")],
+        [InlineKeyboardButton(text=text(language, "btn_manage_subscription"), callback_data="premium:manage")],
+        [InlineKeyboardButton(text=text(language, "btn_payment_history"), callback_data="premium:history")],
+        [InlineKeyboardButton(text=text(language, "btn_premium_info"), callback_data="premium:info")],
+        [menu_button(language)],
+    ]
+    if is_admin:
+        rows.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text=text(
+                        language,
+                        "premium_test_period",
+                        days=ADMIN_TEST_PREMIUM_DAYS,
+                        stars=ADMIN_TEST_PREMIUM_STARS,
+                    ),
+                    callback_data=f"buy:{ADMIN_TEST_PREMIUM_CODE}:{ADMIN_TEST_PREMIUM_STARS}",
+                )
+            ],
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def analytics_keyboard(
-    language: str, rule_id: int, *, detailed: bool = False, back_callback: str = "menu:home"
+    language: str,
+    rule_id: int,
+    app_id: int | None = None,
+    *,
+    back_callback: str = "menu:home",
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=text(language, "btn_refresh_analytics"), callback_data=f"analytics_refresh:{rule_id}"
-                )
+                    text=text(language, "btn_price_history"),
+                    callback_data=f"price_history:{rule_id}:30",
+                ),
+                InlineKeyboardButton(
+                    text=text(language, "btn_compare"),
+                    callback_data=f"premium_compare:rule:{rule_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text=text(language, "btn_change_goal"), callback_data=f"watch:{rule_id}"),
+                *(
+                    [
+                        InlineKeyboardButton(
+                            text=text(language, "btn_steam"),
+                            url=f"https://store.steampowered.com/app/{app_id}",
+                        )
+                    ]
+                    if app_id is not None
+                    else []
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -378,9 +567,30 @@ def analytics_keyboard(
                     callback_data=back_callback,
                 )
             ],
-            [menu_button(language)],
         ]
     )
+
+
+def price_history_keyboard(language: str, rule_id: int, current: str) -> InlineKeyboardMarkup:
+    periods = (("7", "7"), ("30", "30"), ("90", "90"), ("365", "365"), ("all", "all"))
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("✅ " if code == current else "") + text(language, f"history_period_{key}"),
+                callback_data=f"price_history:{rule_id}:{code}",
+            )
+            for code, key in periods[:3]
+        ],
+        [
+            InlineKeyboardButton(
+                text=("✅ " if code == current else "") + text(language, f"history_period_{key}"),
+                callback_data=f"price_history:{rule_id}:{code}",
+            )
+            for code, key in periods[3:]
+        ],
+        [InlineKeyboardButton(text=text(language, "btn_back"), callback_data=f"premium_analytics:{rule_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def giveaways_keyboard(user: User, language: str) -> InlineKeyboardMarkup:
@@ -759,26 +969,24 @@ def premium_games_keyboard(rules: list[WatchRule], action: str, language: str) -
 def notification_keyboard(
     language: str, app_id: int, rule_id: int | None = None, premium: bool = False
 ) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=text(language, "btn_steam"), url=f"https://store.steampowered.com/app/{app_id}")],
-    ]
-    if premium and rule_id is not None:
-        rows.append(
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=text(language, "btn_detailed_analysis"), callback_data=f"premium_analytics:{rule_id}"
+                    text=text(language, "btn_steam"),
+                    url=f"https://store.steampowered.com/app/{app_id}",
                 )
-            ]
-        )
-    rows.append([InlineKeyboardButton(text=text(language, "btn_close"), callback_data="ui:close")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+            ],
+            [InlineKeyboardButton(text=text(language, "btn_close"), callback_data="ui:close")],
+        ]
+    )
 
 
 def deal_broadcast_keyboard(language: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=text(language, "btn_deals"), callback_data="menu:deals")],
-            [InlineKeyboardButton(text=text(language, "btn_close"), callback_data="ui:close")],
+            [InlineKeyboardButton(text=text(language, "btn_broadcast_close"), callback_data="ui:close")],
         ]
     )
 

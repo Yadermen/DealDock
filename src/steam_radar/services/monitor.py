@@ -25,19 +25,29 @@ from steam_radar.db.models import (
     WatchRule,
 )
 from steam_radar.i18n import text
+from steam_radar.services.currency import CurrencyError, CurrencyService
 from steam_radar.services.notifications import NotificationData, build_game_notification
 from steam_radar.services.pricing import format_money
 from steam_radar.services.steam import SteamProvider
+from steam_radar.services.timezones import timezone_from_name
 
 log = structlog.get_logger()
 
 
 class PriceMonitor:
-    def __init__(self, bot: Bot, session_factory: async_sessionmaker, steam: SteamProvider, settings: Settings) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        session_factory: async_sessionmaker,
+        steam: SteamProvider,
+        settings: Settings,
+        currency: CurrencyService | None = None,
+    ) -> None:
         self.bot = bot
         self.session_factory = session_factory
         self.steam = steam
         self.settings = settings
+        self.currency = currency
 
     async def run(self, force: bool = False) -> int:
         lock = self.steam.redis.lock("lock:sync:prices", timeout=1800, blocking_timeout=0)
@@ -136,10 +146,55 @@ class PriceMonitor:
                     PriceSnapshot.checked_at < now,
                 )
             )
-            currency_matches = rule.max_price is None or rule.target_currency in {None, price.currency}
-            matches = currency_matches and self._matches(rule, price.final, price.discount_percent, historical_low)
+            condition_price: Decimal | None = price.final
+            condition_drop: Decimal | None = (
+                latest.final_price - price.final
+                if latest is not None and latest.currency == price.currency and latest.final_price > price.final
+                else None
+            )
+            if rule.target_currency not in {None, price.currency}:
+                if self.currency is None:
+                    condition_price = None
+                    condition_drop = None
+                else:
+                    try:
+                        condition_price, _ = await self.currency.convert(
+                            price.final, price.currency, rule.target_currency
+                        )
+                        if condition_drop is not None:
+                            condition_drop, _ = await self.currency.convert(
+                                condition_drop, price.currency, rule.target_currency
+                            )
+                    except CurrencyError:
+                        log.warning(
+                            "notification_condition_conversion_failed",
+                            rule_id=rule.id,
+                            source_currency=price.currency,
+                            target_currency=rule.target_currency,
+                        )
+                        condition_price = None
+                        condition_drop = None
+            condition_currency_available = condition_price is not None
+            matches = self._matches(
+                rule,
+                price.final,
+                price.discount_percent,
+                historical_low,
+                condition_price=condition_price,
+                condition_currency_available=condition_currency_available,
+            )
             new_low = historical_low is not None and price.final < historical_low
-            reasons = self._notification_reasons(rule, price, latest, historical_low, matches, new_low)
+            reasons = self._notification_reasons(
+                rule,
+                price,
+                latest,
+                historical_low,
+                matches,
+                new_low,
+                condition_price,
+                condition_drop,
+                condition_currency_available,
+            )
             notification_type = "+".join(reasons) if reasons else None
             fingerprint = self._fingerprint(
                 rule.id, notification_type, price.final, price.discount_percent, price.currency
@@ -168,7 +223,7 @@ class PriceMonitor:
                 if not observed_prices or observed_prices[-1] != price.final:
                     observed_prices.append(price.final)
                 try:
-                    local_now = now.astimezone(ZoneInfo(rule.user.timezone))
+                    local_now = now.astimezone(timezone_from_name(rule.user.timezone))
                 except ZoneInfoNotFoundError:
                     local_now = now
                 external_low = await session.scalar(
@@ -320,14 +375,33 @@ class PriceMonitor:
         return fingerprint == rule.last_notification_fingerprint
 
     @staticmethod
-    def _notification_reasons(rule, price, previous, historical_low, matches: bool, new_low: bool) -> list[str]:
+    def _notification_reasons(
+        rule,
+        price,
+        previous,
+        historical_low,
+        matches: bool,
+        new_low: bool,
+        condition_price: Decimal | None = None,
+        condition_drop: Decimal | None = None,
+        condition_currency_available: bool = True,
+    ) -> list[str]:
         reasons: list[str] = []
+        if condition_price is None and condition_currency_available:
+            condition_price = price.final
+        if (
+            condition_drop is None
+            and condition_currency_available
+            and previous is not None
+            and previous.currency == price.currency
+        ):
+            condition_drop = max(Decimal(0), previous.final_price - price.final)
         basic_allowed = not rule.historical_low_only or historical_low is None or price.final <= historical_low
         if (
             basic_allowed
             and rule.max_price is not None
-            and rule.target_currency in {None, price.currency}
-            and price.final <= rule.max_price
+            and condition_price is not None
+            and condition_price <= rule.max_price
         ):
             reasons.append("target")
         if basic_allowed and rule.min_discount is not None and price.discount_percent >= rule.min_discount:
@@ -342,7 +416,11 @@ class PriceMonitor:
                 percent = Decimal(0) if previous.final_price == 0 else drop / previous.final_price * 100
                 if rule.notify_on_any_price_drop:
                     reasons.append("any_drop")
-                if rule.minimum_price_drop_amount is not None and drop >= rule.minimum_price_drop_amount:
+                if (
+                    rule.minimum_price_drop_amount is not None
+                    and condition_drop is not None
+                    and condition_drop >= rule.minimum_price_drop_amount
+                ):
                     reasons.append("drop_amount")
                 if rule.minimum_price_drop_percent is not None and percent >= rule.minimum_price_drop_percent:
                     reasons.append("drop_percent")
@@ -397,7 +475,7 @@ class PriceMonitor:
         if not user.quiet_hours_enabled or not user.quiet_hours_start or not user.quiet_hours_end:
             return None
         try:
-            zone = ZoneInfo(user.timezone)
+            zone = timezone_from_name(user.timezone)
         except ZoneInfoNotFoundError:
             zone = ZoneInfo("UTC")
         local = now.astimezone(zone)
@@ -412,10 +490,19 @@ class PriceMonitor:
         return datetime.combine(end_date, user.quiet_hours_end, tzinfo=zone).astimezone(UTC)
 
     @staticmethod
-    def _matches(rule: WatchRule, price: Decimal, discount: int, historical_low: Decimal | None) -> bool:
+    def _matches(
+        rule: WatchRule,
+        price: Decimal,
+        discount: int,
+        historical_low: Decimal | None,
+        condition_price: Decimal | None = None,
+        condition_currency_available: bool = True,
+    ) -> bool:
+        if condition_price is None and condition_currency_available:
+            condition_price = price
         if rule.historical_low_only and historical_low is not None and price > historical_low:
             return False
-        if rule.max_price is not None and price <= rule.max_price:
+        if rule.max_price is not None and condition_price is not None and condition_price <= rule.max_price:
             return True
         return rule.min_discount is not None and discount >= rule.min_discount
 

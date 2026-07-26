@@ -38,7 +38,7 @@ def test_observed_statistics_are_in_separate_observation_block() -> None:
     now = datetime(2026, 7, 19, 15, 47, tzinfo=UTC)
     snapshots = [snapshot("99.99", "199.99", 3), snapshot("119.99", "199.99")]
     card = build_price_analytics_card("en", "Rust", snapshots, Decimal("79.99"), "PLN", now, now)
-    assert "Steam Radar observation" in card.content
+    assert "DealDock observation" in card.content
     assert "period low" in card.content
     assert "average price" in card.content
     assert "tracked since" in card.content

@@ -5,6 +5,7 @@ from steam_radar.services.giveaway_notifications import GiveawayNotificationServ
 from steam_radar.services.itad import HistoricalLowSync
 from steam_radar.services.monitor import PriceMonitor
 from steam_radar.services.premium import PremiumService
+from steam_radar.services.steam_catalog import SteamCatalogService
 from steam_radar.services.sync import SyncCoordinator
 
 
@@ -15,6 +16,8 @@ def create_scheduler(
     digest: DigestService | None = None,
     historical_lows: HistoricalLowSync | None = None,
     giveaway_notifications: GiveawayNotificationService | None = None,
+    steam_catalog: SteamCatalogService | None = None,
+    steam_catalog_sync_hours: int = 24,
 ) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
@@ -61,5 +64,15 @@ def create_scheduler(
             id="giveaway-notifications",
             max_instances=1,
             coalesce=True,
+        )
+    if steam_catalog:
+        scheduler.add_job(
+            steam_catalog.sync,
+            "interval",
+            hours=steam_catalog_sync_hours,
+            id="steam-catalog",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
         )
     return scheduler

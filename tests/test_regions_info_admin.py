@@ -1,7 +1,13 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from steam_radar.bot.admin import admin_back_keyboard, admin_close_keyboard, admin_keyboard
+from steam_radar.bot.admin import (
+    _admin_time_boundaries,
+    admin_back_keyboard,
+    admin_close_keyboard,
+    admin_keyboard,
+    admin_premium_keyboard,
+)
 from steam_radar.bot.keyboards import info_keyboard, info_page_keyboard, main_keyboard, timezone_keyboard
 from steam_radar.constants import REGIONS
 from steam_radar.i18n import TEXTS
@@ -64,6 +70,7 @@ def test_information_navigation_exists_in_every_language() -> None:
             "info:giveaways",
             "info:analytics",
             "info:premium",
+            "info:referrals",
             "info:region",
             "info:start",
         }.issubset(set(_callbacks(info_keyboard(language))))
@@ -79,6 +86,18 @@ def test_every_admin_keyboard_variant_has_close() -> None:
         for markup in (admin_keyboard(language), admin_back_keyboard(language), admin_close_keyboard(language)):
             assert "admin:close" in _callbacks(markup)
             assert "menu:home" not in _callbacks(markup)
+
+
+def test_admin_user_card_requires_confirmed_delete() -> None:
+    callbacks = _callbacks(admin_premium_keyboard("en", 42, False))
+    assert "admin_user_delete:42" in callbacks
+    assert "admin_user_delete_confirm:42" not in callbacks
+
+
+def test_admin_panel_uses_matching_database_datetime_boundaries() -> None:
+    aware, naive = _admin_time_boundaries()
+    assert aware.tzinfo is not None
+    assert naive.tzinfo is None
 
 
 def test_removed_support_commands_are_absent_from_runtime_ui() -> None:
